@@ -1,0 +1,15 @@
+[Unit]
+Description=BMI270 crash IMU logger
+After=multi-user.target
+
+[Service]
+Type=simple
+# Reads /opt/imu-logger/config.json at startup; edit it and
+# `sudo systemctl restart imu-logger` to begin a new recording
+# with the new settings. Recordings land in /opt/imu-logger/data/.
+ExecStart=/usr/bin/python3 /opt/imu-logger/imu_logger.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

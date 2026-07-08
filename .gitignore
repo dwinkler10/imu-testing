@@ -1,0 +1,16 @@
+# recordings and analysis outputs (data, not source)
+outputs/
+tests/
+data/
+
+# Bosch 8 kB sensor init blob -- fetch once with get_config.py
+bmi270_config.bin
+
+# external clone of betaflight/blackbox-tools -- see README
+blackbox-tools/
+
+# local noise
+.DS_Store
+__pycache__/
+*.pyc
+.claude/

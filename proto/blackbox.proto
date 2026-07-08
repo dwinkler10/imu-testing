@@ -1,0 +1,45 @@
+syntax = "proto3";
+package crashlog;
+
+import "common.proto";
+
+// roll/pitch/yaw rate commands plus throttle
+message StickCommand {
+  double roll = 1;
+  double pitch = 2;
+  double yaw = 3;
+  double throttle = 4;
+}
+
+message Battery {
+  double voltage_v = 1;
+  double current_a = 2;
+  double mah = 3;  // cumulative energy drawn
+}
+
+// One decoded Betaflight blackbox frame (bbl_convert.py).
+message BlackboxFrame {
+  uint64 time_us = 1;        // flight controller clock since boot
+  uint64 loop = 2;           // PID loop iteration
+  Vector3 gyro_dps = 3;      // filtered gyro
+  Vector3 gyro_raw = 4;      // unfiltered gyro (raw LSB)
+  Vector3 acc_g = 5;         // filtered accelerometer
+  StickCommand setpoint = 6;
+  StickCommand rc_command = 7;
+  repeated double motor = 8;
+  repeated double erpm = 9;  // eRPM/100 per motor
+  repeated double pid_p = 10;
+  repeated double pid_i = 11;
+  repeated double pid_d = 12;
+  repeated double pid_f = 13;
+  repeated double debug = 14;
+  Battery battery = 15;
+  double baro_alt = 16;
+  double rssi = 17;
+  string flight_mode = 18;
+  string state_flags = 19;
+  string failsafe = 20;
+  uint32 rx_signal = 21;
+  uint32 rx_channels_valid = 22;
+  map<string, double> extras = 23;  // columns not covered above
+}

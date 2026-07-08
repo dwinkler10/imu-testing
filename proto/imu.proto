@@ -1,0 +1,14 @@
+syntax = "proto3";
+package crashlog;
+
+import "common.proto";
+
+// One BMI270 sample from the Raspberry Pi crash logger (imu_logger.py).
+message ImuSample {
+  uint64 host_time_ns = 1;  // Pi CLOCK_REALTIME at readout
+  uint32 sensortime = 2;    // BMI270 24-bit counter, 39.0625 us/LSB
+  Vector3 accel_g = 3;      // +/-16 g range, CAS-corrected gyro below
+  Vector3 gyro_dps = 4;     // +/-2000 dps range
+  bool acc_saturated = 5;   // BMI270 FIFO tag: accel filter pipeline saturated
+  bool gyr_saturated = 6;   // BMI270 FIFO tag: gyro filter pipeline saturated
+}
