@@ -31,8 +31,14 @@ is ~0.3-0.4 ms on a Pi 5 at 1 MHz I2C, so 800 Hz (1.25 ms period)
 leaves comfortable margin while 1600 Hz (625 us) does not and will
 drop samples whenever the scheduler hiccups.
 
+Recordings are named boot_<idx>_<stamp>.bin, where <idx> is a
+monotonic counter persisted in data/.boot_counter (so every start gets
+a distinct, ordered name even with no RTC / a backward clock after an
+unclean power cut). data/ is capped at MAX_BYTES: the oldest boot_*.bin
+files are deleted at startup until the directory fits.
+
 On-disk format (little-endian):
-  header, 16 bytes: magic "IMULOG04", int8 gyro CAS factor_zx,
+  header, 16 bytes: magic "IMULOG05", int8 gyro CAS factor_zx,
                     uint8 accel range [g], uint16 gyro range [dps],
                     uint32 sensortime ticks per sample
                     (ticks are 39.0625 us; 800 Hz -> 32 ticks)
@@ -85,11 +91,16 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_BLOB = os.path.join(SCRIPT_DIR, "bmi270_config.bin")
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 OUT_DIR = os.path.join(SCRIPT_DIR, "data")
+COUNTER_PATH = os.path.join(OUT_DIR, ".boot_counter")
 # Crash-resilience knob. On a hard power cut, at-risk data = up to one
 # fsync interval written but not yet durable (there is no other
 # buffering: each sample is written to the file the moment it is read
 # off the chip).
 FSYNC_INTERVAL_S = 0.05        # max written-but-unsynced data at risk
+# Rolling storage budget for data/. Oldest recordings are deleted at
+# startup until the directory fits. A ~20 min flight at 800 Hz is
+# ~24 MB, so 2 GB keeps ~80 recordings before anything rolls off.
+MAX_BYTES = 2 * 1024**3
 
 # BMI270 registers (datasheet section 5.2)
 CHIP_ID, INTERNAL_STATUS = 0x00, 0x21
@@ -241,6 +252,79 @@ def init_bmi270(bus, cfg):
     return cas - 128 if cas & 0x40 else cas       # sign-extend 7-bit
 
 
+def boot_index_of(name):
+    """Parse the boot counter out of a boot_<idx>_<stamp>.bin filename;
+    0 if it doesn't match (sorts such files oldest)."""
+    try:
+        return int(name.split("_")[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def next_boot_index():
+    """Monotonic per-recording counter, persisted in data/ so it
+    survives reboots and never depends on the wall clock (the Pi has no
+    RTC, and after an unclean power cut the clock can jump backward).
+    Read, increment, write back atomically via a temp file + rename."""
+    try:
+        with open(COUNTER_PATH) as f:
+            n = int(f.read().strip()) + 1
+    except (FileNotFoundError, ValueError):
+        n = 1
+    tmp = COUNTER_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(n))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, COUNTER_PATH)
+    return n
+
+
+def prune_storage(budget=MAX_BYTES):
+    """Delete oldest boot_*.bin recordings until data/ fits in `budget`
+    bytes. Oldest = lowest boot index, which is clock-independent (a
+    backward clock jump can't reorder them)."""
+    files = []
+    for name in os.listdir(OUT_DIR):
+        if name.startswith("boot_") and name.endswith(".bin"):
+            p = os.path.join(OUT_DIR, name)
+            try:
+                files.append((boot_index_of(name), os.path.getsize(p), p))
+            except OSError:
+                continue
+    total = sum(sz for _, sz, _ in files)
+    for _, sz, p in sorted(files):        # ascending index = oldest first
+        if total <= budget:
+            break
+        try:
+            os.remove(p)
+            total -= sz
+            print(f"rolling storage: removed {os.path.basename(p)}")
+        except OSError:
+            pass
+
+
+def open_recording():
+    """Prune to budget, then create a fresh recording file named
+    boot_<idx>_<stamp>.bin. O_EXCL guarantees a brand-new file so a
+    same-second/backward clock can never append onto an old recording;
+    the monotonic idx makes that essentially impossible anyway. Returns
+    (fd, path)."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    prune_storage()
+    idx = next_boot_index()
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    for attempt in range(1000):
+        tail = "" if attempt == 0 else f"_{attempt}"
+        path = os.path.join(OUT_DIR, f"boot_{idx:06d}_{stamp}{tail}.bin")
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            return fd, path
+        except FileExistsError:
+            continue
+    raise SystemExit(f"could not create a unique recording file in {OUT_DIR}")
+
+
 def main():
     try:  # real-time priority; needs root, best effort otherwise
         os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(50))
@@ -262,9 +346,7 @@ def main():
     with SMBus(I2C_BUS) as bus:
         cas = init_bmi270(bus, cfg)
 
-        os.makedirs(OUT_DIR, exist_ok=True)
-        path = os.path.join(OUT_DIR, time.strftime("imu_%Y%m%d_%H%M%S.bin"))
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        fd, path = open_recording()
         os.write(fd, HEADER.pack(b"IMULOG05", cas, ACC_RANGE_G[cfg["acc_range"]],
                                  GYR_RANGE_DPS[cfg["gyr_range"]], ticks))
         os.fsync(fd)

@@ -2,7 +2,7 @@
 """Convert a .bin file from imu_logger.py to CSV and Foxglove-viewable MCAP
 (protobuf-encoded crashlog.ImuSample messages, see proto/imu.proto).
 
-Usage: python3 convert.py data/imu_20260707_120000.bin
+Usage: python3 convert.py data/boot_000001_20260707_120000.bin
 Writes .csv and .mcap next to the input file.
 
 Reads the direct-polling logger's IMULOG05 format (and older

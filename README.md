@@ -50,8 +50,14 @@ newly configured it asks for one `sudo reboot`; logging starts automatically
 afterwards. Re-running `deploy.sh` updates the code but **preserves an edited
 `config.json` on the Pi**.
 
-Recordings land in `/opt/imu-logger/data/imu_YYYYMMDD_HHMMSS.bin` (~72 MB/h
-at 800 Hz — clear the card before a campaign).
+Recordings land in `/opt/imu-logger/data/boot_<idx>_<YYYYMMDD_HHMMSS>.bin`
+(~72 MB/h at 800 Hz; a ~20 min flight is ~24 MB). `<idx>` is a monotonic
+counter persisted in `data/.boot_counter`, so every start — every boot, every
+service restart — gets a distinct, ordered filename **even with no RTC or a
+backward clock jump after an unclean power cut** (the timestamp is for humans
+only; the counter guarantees uniqueness). `data/` is a **rolling 2 GB store**
+(`MAX_BYTES`): the oldest recordings are deleted at startup until it fits, so
+the card never fills — no manual clearing needed.
 
 ## Configuration
 
@@ -94,7 +100,7 @@ sudo python3 /opt/imu-logger/imu_logger.py   # sudo -> real-time priority; Ctrl-
 
 ```sh
 pip install mcap-protobuf-support protobuf   # converter deps (not needed on the Pi)
-python3 convert.py data/imu_20260707_120000.bin
+python3 convert.py data/boot_000001_20260707_120000.bin
 ```
 
 Produces `.csv` and `.mcap` next to the input. Messages are protobuf-encoded
