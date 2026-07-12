@@ -2,19 +2,21 @@
 
 Logs **raw, unfiltered accel + gyro** with Raspberry Pi clock timestamps and
 continuous flushing to disk. Sample rate, ranges, and filter mode are set in
-[config.json](config.json); the defaults are **1600 Hz, ±16 g / ±2000 dps,
-aliasing-free filter mode** — the widest ranges and full bandwidth the BMI270
-offers. Values are stored untouched (only the datasheet-mandated gyro
-cross-axis correction is applied offline) so a future jerk-based
-crash-detection state machine sees the true signal, not a smoothed one.
+[config.json](config.json); the defaults are **800 Hz, ±16 g / ±2000 dps,
+aliasing-free filter mode** — the widest ranges the BMI270 offers. Values are
+stored untouched (only the datasheet-mandated gyro cross-axis correction is
+applied offline) so a jerk-based crash-detection state machine sees the true
+signal, not a smoothed one.
 
-Samples are drained from the BMI270's **on-chip FIFO** (header mode) rather
-than polled from the data registers. Direct-register polling raced the Pi's
-scheduler against the fixed 625 µs sample period and dropped ~4 % of samples to
-timing jitter during flight; the FIFO buffers on-chip with hardware-exact
-timing, so the record stream is gap-free and evenly spaced. Each frame also
-carries the sensor's own **accel/gyro saturation flag** (§4.7.4), so clipping
-is reported by the chip's filter pipeline instead of guessed from magnitude.
+Samples are **polled directly from the data registers** as fast as the I2C
+bus allows — no on-chip FIFO buffering. Each sample is on disk (page cache)
+within one poll cycle (~0.3 ms) of leaving the sensor, so a crash-detection
+test sees data in true realtime instead of waiting out a FIFO drain interval.
+The tradeoff: if the OS stalls the poll loop for more than one sample period,
+that sample is overwritten unread. At 800 Hz (1.25 ms period) the loop has
+comfortable margin; missed samples are detected via hardware **sensortime**
+gaps, counted, and reported live and at exit (1600 Hz previously dropped ~4 %
+this way — that's why 800 Hz is the recommended ceiling).
 
 ## Wiring — check pin 4!
 
@@ -48,8 +50,8 @@ newly configured it asks for one `sudo reboot`; logging starts automatically
 afterwards. Re-running `deploy.sh` updates the code but **preserves an edited
 `config.json` on the Pi**.
 
-Recordings land in `/opt/imu-logger/data/imu_YYYYMMDD_HHMMSS.bin` (~144 MB/h
-at 1600 Hz — clear the card before a campaign).
+Recordings land in `/opt/imu-logger/data/imu_YYYYMMDD_HHMMSS.bin` (~72 MB/h
+at 800 Hz — clear the card before a campaign).
 
 ## Configuration
 
@@ -65,7 +67,7 @@ sudo systemctl restart imu-logger
 | key | register field | default | meaning |
 |-----|----------------|---------|---------|
 | `acc_en` / `gyr_en` | `PWR_CTRL` | `0x01` | sensor on/off |
-| `acc_odr` / `gyr_odr` | `*_CONF.odr` | `0x0c` | sample rate: `0x0c`=1600 Hz, `0x0b`=800, `0x0a`=400, … (25·2ᵏ Hz) |
+| `acc_odr` / `gyr_odr` | `*_CONF.odr` | `0x0b` | sample rate: `0x0c`=1600 Hz, `0x0b`=800, `0x0a`=400, … (25·2ᵏ Hz) |
 | `acc_bwp` / `gyr_bwp` | `*_CONF.bwp` | `0x02` | filter bandwidth (`0x02` = normal) |
 | `acc_filter_perf` / `gyr_filter_perf` | `*_CONF.filter_perf` | `0x01` | 1 = aliasing-free performance filter |
 | `gyr_noise_perf` | `GYR_CONF.noise_perf` | `0x01` | 1 = low-noise mode |
@@ -76,8 +78,10 @@ Missing keys fall back to the defaults above. The config is validated at
 startup and the service fails visibly (see `systemctl status imu-logger`) on
 unknown keys or unsupported values rather than recording bad data. One
 constraint: **`acc_odr` must equal `gyr_odr` while both sensors are enabled**
-— the frame-timing model requires a single common sample clock (a gyro-only
-config may go up to `0x0d` = 3200 Hz).
+— one data-ready bit triggers the record of both sensors' registers, so they
+must share a sample clock. Rates above 800 Hz are accepted but the poll loop
+(~0.3–0.4 ms/cycle) will lose samples whenever the scheduler hiccups; the
+logger reports every loss live.
 
 ## Run manually (bench tests)
 
@@ -98,9 +102,8 @@ Produces `.csv` and `.mcap` next to the input. Messages are protobuf-encoded
 in [Foxglove](https://foxglove.dev) and plot `/imu.accel_g.x` …
 `/imu.gyro_dps.z`, plus the boolean `/imu.acc_saturated` /
 `/imu.gyr_saturated` flags. The converter drops a crash-truncated partial last
-record automatically, reports total per-axis saturation counts, and
-cross-checks for sample loss via sensortime gaps (which should be zero — the
-logger reports any real FIFO overflow live).
+record automatically, reports total saturation counts, and cross-checks for
+sample loss via sensortime gaps (the logger also reports every loss live).
 
 ## Betaflight Blackbox (.BBL) → CSV + MCAP
 
@@ -136,35 +139,32 @@ python3 -m grpc_tools.protoc -Iproto --python_out=proto proto/*.proto
 
 ## Design notes
 
-- **FIFO, header mode, acc+gyr only.** The logger drains the chip's 2 KB FIFO
-  every 10 ms (`FIFO_POLL_INTERVAL_S`) — far under the ≥91 ms it takes to fill
-  even at the fastest configuration, so it never overflows. Each frame is
-  parsed to a 25-byte record (host time, sensortime, six int16 axes,
-  saturation flags) written to disk immediately; `fsync` runs every 50 ms
-  (`FSYNC_INTERVAL_S`).
-- **Crash-resilience tradeoff.** Using the FIFO is the one place buffering
-  became unavoidable — it was the price of eliminating the ~4 % flight sample
-  drops. On a hard power cut, at-risk data ≈ one poll interval still in the
-  FIFO SRAM (≤10 ms, lost with the chip) + one fsync interval written but not
-  yet durable (≤50 ms). Shorten either constant to trade CPU/I-O for tighter
-  crash capture. (In the reference drone crash the flight-controller log ended
-  cleanly, i.e. battery power survived impact, so the FIFO residency is
-  unlikely to eat the crash instant in practice.)
-- **Timing.** Every frame is exactly one ODR period apart — hardware-exact,
-  no OS jitter — so sensortime is tracked in software (+1 period per frame;
-  16 ticks at 1600 Hz). The period is written into the file header
-  (`IMULOG03`) so the converter scales and gap-checks correctly for any
-  configured rate. `host_time_ns` (`CLOCK_REALTIME`) is captured per drain
-  and each frame back-dated by its exact offset, giving uniform spacing for
-  later differentiation into jerk — but it can step back a few ms across
-  drain boundaries, so use `sensortime` as the analysis timeline.
-- **Rates.** Both sensors default to 1600 Hz. The gyro alone could do
-  3200 Hz (`gyr_odr: 0x0d` with `acc_en: 0`), but its filter bandwidth only
-  rises 557 → 751 Hz for double the data — not worth it.
-- **Saturation flags** come from `FIFO_CONFIG_1` frame tagging (`acc_sat` on
-  the INT1 slot, `gyr_sat` on INT2), read out of each frame header's `fh_ext`
-  bits — no interrupt pins need wiring. If a bench test taps the accel axis and
-  the *gyr* flag lights instead, the two `fh_ext` bits are swapped for your
-  part — flip bits 0/1 in `convert.py`.
+- **Direct-register busy-poll, no FIFO.** Each loop iteration burst-reads
+  `STATUS` through `SENSORTIME` (0x03–0x1A, 24 bytes) in one I2C transaction
+  and keeps the sample only when the data-ready bit says it's new (the read
+  clears the bit, so nothing is recorded twice). Each sample becomes a
+  25-byte record (host time, sensortime, six int16 axes, clip flags) written
+  to disk immediately; `fsync` runs every 50 ms (`FSYNC_INTERVAL_S`). The
+  loop never sleeps, so it pins one core — acceptable on a quad-core Pi 5 in
+  exchange for minimum sensor-to-disk latency.
+- **Crash-resilience.** With no buffering anywhere between sensor and page
+  cache, at-risk data on a hard power cut ≈ one fsync interval (≤50 ms)
+  written but not yet durable, plus the ≲1 sample still inside the chip.
+  Shorten `FSYNC_INTERVAL_S` to trade I/O for tighter crash capture.
+- **Timing.** `sensortime` is the chip's 24-bit 39.0625 µs hardware counter,
+  latched in the same burst as the data. It is stamped at *readout*, so
+  consecutive deltas are one ODR period ± sub-period poll jitter; the
+  converter rounds deltas to whole periods (written into the `IMULOG04`
+  header) for gap-checking, and a jerk detector should difference against the
+  nominal period, not raw per-sample deltas. `host_time_ns`
+  (`CLOCK_REALTIME`) is read per sample right after the I2C burst.
+- **Rates.** Both sensors default to 800 Hz — the fastest rate the ~0.3–0.4 ms
+  poll cycle can service with margin. 1600 Hz historically lost ~4 % of
+  samples to scheduler jitter; if you need it, the FIFO-based logger
+  (`IMULOG03`, in git history) is the right tool.
+- **Clip flags** are inferred by the logger: the flag bit is set when any
+  axis of that sensor sits at the int16 rail (±32767/−32768). The FIFO-era
+  hardware saturation tag (§4.7.4) only exists in FIFO frames, so it is not
+  available in direct-read mode.
 - **Units.** Raw int16 are stored; the converter scales to g and dps and
   applies the datasheet's gyro cross-axis (CAS) correction (§4.6.10).

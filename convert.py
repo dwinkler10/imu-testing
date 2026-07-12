@@ -5,21 +5,23 @@
 Usage: python3 convert.py data/imu_20260707_120000.bin
 Writes .csv and .mcap next to the input file.
 
-Reads the FIFO-based logger's IMULOG03 format (and the older fixed
-1600 Hz IMULOG02): the header carries the configured ranges and the
-sample spacing in sensortime ticks, and each record carries a
-hardware acc/gyr saturation tag from the BMI270's own filter pipeline
-(FIFO_CONFIG_1 tag_int1/2_en, datasheet 4.7.4) rather than a post-hoc
-magnitude guess.
+Reads the direct-polling logger's IMULOG04 format (and the older
+FIFO-based IMULOG03 / fixed 1600 Hz IMULOG02): the header carries the
+configured ranges and the sample spacing in sensortime ticks. The
+per-record saturation flags mean "output at the int16 rail" (range
+clipping inferred by the logger) in IMULOG04; in IMULOG03 they were
+the BMI270's own FIFO-frame saturation tag, which does not exist
+outside FIFO mode.
 
 No filtering/smoothing is applied -- values are raw sensor output
 (with only the mandatory CAS correction, see below) so a later
 jerk-based crash detector sees untouched data.
 
 Handles a crash-corrupted tail (partial last record is dropped) and
-cross-checks for sample loss via sensortime gaps (should be zero
-barring an actual FIFO overflow, which the logger already reports
-live -- this is a sanity check, not the primary loss metric).
+cross-checks for sample loss via sensortime gaps. IMULOG04 sensortime
+is latched at readout, so deltas carry sub-period jitter; they are
+rounded to whole ODR periods before gap-checking (exact for the older
+formats, whose deltas are exact multiples).
 Applies the gyro cross-axis (CAS) correction from datasheet section
 4.6.10:
   gx_corrected = gx - factor_zx * gz / 2^9
@@ -44,8 +46,8 @@ def main(path):
     magic, cas, acc_range, gyr_range, ticks = HEADER.unpack(raw[:HEADER.size])
     if magic == b"IMULOG02":
         ticks = 16                         # fixed 1600 Hz era, field was reserved
-    elif magic != b"IMULOG03":
-        raise SystemExit(f"unknown magic {magic!r} (expected IMULOG02/IMULOG03)")
+    elif magic not in (b"IMULOG03", b"IMULOG04"):
+        raise SystemExit(f"unknown magic {magic!r} (expected IMULOG02..IMULOG04)")
     rate_hz = 25600 / ticks                # sensortime runs at 25.6 kHz
     body = raw[HEADER.size:]
     n = len(body) // RECORD.size
@@ -73,10 +75,11 @@ def main(path):
         gyr_sat_n += gyr_sat
 
         if prev_st is not None:
-            delta = (st - prev_st) & 0xFFFFFF  # 24-bit counter wraps
-            if delta > ticks:                  # one ODR period per sample
+            delta = (st - prev_st) & 0xFFFFFF     # 24-bit counter wraps
+            periods = (delta + ticks // 2) // ticks   # round off readout jitter
+            if periods > 1:                       # one ODR period per sample
                 gaps += 1
-                dropped += delta // ticks - 1
+                dropped += periods - 1
         prev_st = st
 
         gx = gx - cas * gz / 512.0             # CAS correction (x-axis only)
@@ -102,7 +105,7 @@ def main(path):
     if gaps:
         print(f"warning: {gaps} sensortime gaps (~{dropped} samples apparently missing)")
     if acc_sat_n or gyr_sat_n:
-        print(f"hardware saturation flags: accel {acc_sat_n}/{n} samples, "
+        print(f"saturation flags: accel {acc_sat_n}/{n} samples, "
               f"gyro {gyr_sat_n}/{n} samples")
 
 

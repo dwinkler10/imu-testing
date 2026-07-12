@@ -1,12 +1,12 @@
 {
   "acc_en": "0x01",
-  "acc_odr": "0x0c",
+  "acc_odr": "0x0b",
   "acc_bwp": "0x02",
   "acc_filter_perf": "0x01",
   "acc_range": "0x03",
 
   "gyr_en": "0x01",
-  "gyr_odr": "0x0c",
+  "gyr_odr": "0x0b",
   "gyr_bwp": "0x02",
   "gyr_noise_perf": "0x01",
   "gyr_filter_perf": "0x01",

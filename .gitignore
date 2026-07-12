@@ -2,6 +2,7 @@
 outputs/
 tests/
 data/
+analysis/*.png
 
 # Bosch 8 kB sensor init blob -- fetch once with get_config.py
 bmi270_config.bin
