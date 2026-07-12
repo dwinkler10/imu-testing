@@ -5,13 +5,17 @@
 Usage: python3 convert.py data/imu_20260707_120000.bin
 Writes .csv and .mcap next to the input file.
 
-Reads the direct-polling logger's IMULOG04 format (and the older
-FIFO-based IMULOG03 / fixed 1600 Hz IMULOG02): the header carries the
-configured ranges and the sample spacing in sensortime ticks. The
-per-record saturation flags mean "output at the int16 rail" (range
-clipping inferred by the logger) in IMULOG04; in IMULOG03 they were
-the BMI270's own FIFO-frame saturation tag, which does not exist
-outside FIFO mode.
+Reads the direct-polling logger's IMULOG05 format (and older
+IMULOG02..04): the header carries the configured ranges and the
+sample spacing in sensortime ticks. The per-record flags byte is
+decoded per format:
+  IMULOG05 -> BMI270 SATURATION register 0x4A, six per-axis bits
+              (acc x/y/z, gyr x/y/z): a raw pre-filter sample on that
+              axis hit the +/-full-scale rail.
+  IMULOG04 -> logger-inferred "output at the int16 rail", aggregate
+              (bit0 acc, bit1 gyr) -> mapped onto all three axes.
+  IMULOG03 -> BMI270 FIFO-frame saturation tag, aggregate, same mapping.
+  IMULOG02 -> no saturation info.
 
 No filtering/smoothing is applied -- values are raw sensor output
 (with only the mandatory CAS correction, see below) so a later
@@ -46,8 +50,9 @@ def main(path):
     magic, cas, acc_range, gyr_range, ticks = HEADER.unpack(raw[:HEADER.size])
     if magic == b"IMULOG02":
         ticks = 16                         # fixed 1600 Hz era, field was reserved
-    elif magic not in (b"IMULOG03", b"IMULOG04"):
-        raise SystemExit(f"unknown magic {magic!r} (expected IMULOG02..IMULOG04)")
+    elif magic not in (b"IMULOG03", b"IMULOG04", b"IMULOG05"):
+        raise SystemExit(f"unknown magic {magic!r} (expected IMULOG02..IMULOG05)")
+    per_axis_sat = magic == b"IMULOG05"    # 6-bit hardware SATURATION register
     rate_hz = 25600 / ticks                # sensortime runs at 25.6 kHz
     body = raw[HEADER.size:]
     n = len(body) // RECORD.size
@@ -62,17 +67,24 @@ def main(path):
     cw = csv.writer(csv_f)
     cw.writerow(["host_time_ns", "sensortime",
                  "ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps",
-                 "acc_saturated", "gyr_saturated"])
+                 "acc_sat_x", "acc_sat_y", "acc_sat_z",
+                 "gyr_sat_x", "gyr_sat_y", "gyr_sat_z"])
 
     mcap_f = open(base + ".mcap", "wb")
     mw = Writer(mcap_f)
 
-    prev_st, gaps, dropped, acc_sat_n, gyr_sat_n = None, 0, 0, 0, 0
+    prev_st, gaps, dropped = None, 0, 0
+    acc_sat_n, gyr_sat_n = 0, 0
     for i in range(n):
         t, st, ax, ay, az, gx, gy, gz, flags = RECORD.unpack_from(body, i * RECORD.size)
-        acc_sat, gyr_sat = bool(flags & 0x01), bool(flags & 0x02)
-        acc_sat_n += acc_sat
-        gyr_sat_n += gyr_sat
+        if per_axis_sat:                          # SATURATION reg 0x4A bits
+            a = (bool(flags & 0x01), bool(flags & 0x02), bool(flags & 0x04))
+            g = (bool(flags & 0x08), bool(flags & 0x10), bool(flags & 0x20))
+        else:                                     # aggregate flag -> all axes
+            a = (bool(flags & 0x01),) * 3
+            g = (bool(flags & 0x02),) * 3
+        acc_sat_n += any(a)
+        gyr_sat_n += any(g)
 
         if prev_st is not None:
             delta = (st - prev_st) & 0xFFFFFF     # 24-bit counter wraps
@@ -83,18 +95,20 @@ def main(path):
         prev_st = st
 
         gx = gx - cas * gz / 512.0             # CAS correction (x-axis only)
-        s = imu_pb2.ImuSample(host_time_ns=t, sensortime=st,
-                               acc_saturated=acc_sat, gyr_saturated=gyr_sat)
+        s = imu_pb2.ImuSample(host_time_ns=t, sensortime=st)
         s.accel_g.x, s.accel_g.y, s.accel_g.z = (
             ax * acc_scale, ay * acc_scale, az * acc_scale)
         s.gyro_dps.x, s.gyro_dps.y, s.gyro_dps.z = (
             gx * gyr_scale, gy * gyr_scale, gz * gyr_scale)
+        s.acc_saturated.x, s.acc_saturated.y, s.acc_saturated.z = a
+        s.gyr_saturated.x, s.gyr_saturated.y, s.gyr_saturated.z = g
 
         cw.writerow((t, st,
                      round(s.accel_g.x, 5), round(s.accel_g.y, 5),
                      round(s.accel_g.z, 5), round(s.gyro_dps.x, 4),
                      round(s.gyro_dps.y, 4), round(s.gyro_dps.z, 4),
-                     int(acc_sat), int(gyr_sat)))
+                     int(a[0]), int(a[1]), int(a[2]),
+                     int(g[0]), int(g[1]), int(g[2])))
         mw.write_message("/imu", s, log_time=t, publish_time=t)
 
     mw.finish()
@@ -105,8 +119,7 @@ def main(path):
     if gaps:
         print(f"warning: {gaps} sensortime gaps (~{dropped} samples apparently missing)")
     if acc_sat_n or gyr_sat_n:
-        print(f"saturation flags: accel {acc_sat_n}/{n} samples, "
-              f"gyro {gyr_sat_n}/{n} samples")
+        print(f"saturation: accel {acc_sat_n}/{n} samples, gyro {gyr_sat_n}/{n} samples")
 
 
 if __name__ == "__main__":

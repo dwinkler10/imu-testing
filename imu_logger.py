@@ -40,12 +40,28 @@ On-disk format (little-endian):
                           after the sample's I2C burst, uint32
                           sensortime (24-bit, 39.0625 us/LSB, latched
                           in the same burst), int16 ax, ay, az, gx,
-                          gy, gz (raw LSB), uint8 flags
-                          (bit0 = accel at int16 rail, bit1 = gyro at
-                          int16 rail; range clipping inferred from
-                          the output value -- the hardware saturation
-                          tag of the FIFO-era format only exists in
-                          FIFO frames)
+                          gy, gz (raw LSB), uint8 saturation
+                          (SATURATION register 0x4A, datasheet 5.2.51:
+                          bit0 acc_x, bit1 acc_y, bit2 acc_z, bit3
+                          gyr_x, bit4 gyr_y, bit5 gyr_z -- each set
+                          when a raw pre-filter sample on that axis
+                          hit the +/-full-scale rail)
+
+Read consistency. acc/gyr/sensortime are read in one burst spanning
+0x03..0x1A, which is entirely inside the register shadow group
+(STATUS, DATA_x, SENSORTIME_x; datasheet 5.1): starting the burst
+freezes the whole group, so those three are guaranteed to belong to
+the same sample -- they cannot tear mid-read. SATURATION (0x4A) is
+NOT in that shadow group, so it cannot be frozen together with the
+data; it is instead read FIRST in the *same* i2c_rdwr transaction
+(repeated start, single stop), one address-cycle (~tens of us) before
+the data burst latches. It updates synchronously with the data
+registers (5.2.51), so the only residual risk is a <=1-sample edge
+misalignment of the flag if an ODR boundary happens to fall in that
+tiny gap -- harmless, since saturation occurs in multi-sample runs.
+Perfectly frame-locked saturation is only available via the FIFO
+frame-header tag, which this direct-polling logger trades away for
+sensor-to-disk latency.
 
 Both timestamps are per-sample and taken at readout, so they carry up
 to one poll cycle of jitter relative to the hardware-exact sample
@@ -78,6 +94,7 @@ FSYNC_INTERVAL_S = 0.05        # max written-but-unsynced data at risk
 # BMI270 registers (datasheet section 5.2)
 CHIP_ID, INTERNAL_STATUS = 0x00, 0x21
 STATUS = 0x03                  # bit7 drdy_acc, bit6 drdy_gyr
+SATURATION = 0x4A              # per-axis raw-saturation flags (5.2.51)
 FEAT_PAGE, GYR_CAS = 0x2F, 0x3C
 ACC_CONF, ACC_RANGE, GYR_CONF, GYR_RANGE = 0x40, 0x41, 0x42, 0x43
 INIT_CTRL, INIT_ADDR_0, INIT_ADDR_1, INIT_DATA = 0x59, 0x5B, 0x5C, 0x5E
@@ -248,28 +265,35 @@ def main():
         os.makedirs(OUT_DIR, exist_ok=True)
         path = os.path.join(OUT_DIR, time.strftime("imu_%Y%m%d_%H%M%S.bin"))
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        os.write(fd, HEADER.pack(b"IMULOG04", cas, ACC_RANGE_G[cfg["acc_range"]],
+        os.write(fd, HEADER.pack(b"IMULOG05", cas, ACC_RANGE_G[cfg["acc_range"]],
                                  GYR_RANGE_DPS[cfg["gyr_range"]], ticks))
         os.fsync(fd)
         print(f"logging to {path} (Ctrl-C to stop)")
 
         write, pack, unpack_axes = os.write, RECORD.pack, AXES.unpack_from
-        reg_ptr = [STATUS]
         n, dropped, prev_st = 0, 0, None
         next_sync = time.monotonic()
         try:
             while True:
-                # Busy-poll: burst-read status + data + sensortime and
-                # keep the sample only if the drdy bit says it's new
-                # (the read itself clears drdy, so no double-records).
-                w, r = i2c_msg.write(ADDR, reg_ptr), i2c_msg.read(ADDR, BURST_LEN)
-                bus.i2c_rdwr(w, r)
-                buf = bytes(r)
+                # Busy-poll in ONE i2c transaction (repeated start, single
+                # stop). SATURATION (0x4A, not in a shadow group) is read
+                # FIRST so it is captured one address-cycle (~tens of us)
+                # before the 0x03..0x1A data burst freezes its shadow
+                # group -- that group (STATUS+DATA+SENSORTIME, datasheet
+                # 5.1) is atomic, so acc/gyr/sensortime are same-frame,
+                # and the sat-to-data gap is bounded to that address cycle.
+                # The data read clears drdy, so a sample is kept once.
+                sat = i2c_msg.read(ADDR, 1)
+                data = i2c_msg.read(ADDR, BURST_LEN)
+                bus.i2c_rdwr(i2c_msg.write(ADDR, [SATURATION]), sat,
+                             i2c_msg.write(ADDR, [STATUS]), data)
+                buf = bytes(data)
                 if not buf[0] & drdy_mask:
                     continue
                 t = time.time_ns()
                 ax, ay, az, gx, gy, gz = unpack_axes(buf, ACC_OFS)
                 st = buf[ST_OFS] | buf[ST_OFS + 1] << 8 | buf[ST_OFS + 2] << 16
+                saturation = bytes(sat)[0] & 0x3F   # 6 per-axis bits (reg 0x4A)
 
                 if prev_st is not None:
                     # Hardware sensortime deltas are k ODR periods plus
@@ -281,10 +305,7 @@ def main():
                               f"~{periods - 1} sample(s) lost")
                 prev_st = st
 
-                acc_rail = max(ax, ay, az) == 32767 or min(ax, ay, az) == -32768
-                gyr_rail = max(gx, gy, gz) == 32767 or min(gx, gy, gz) == -32768
-                write(fd, pack(t, st, ax, ay, az, gx, gy, gz,
-                               acc_rail | gyr_rail << 1))
+                write(fd, pack(t, st, ax, ay, az, gx, gy, gz, saturation))
                 n += 1
                 now = time.monotonic()
                 if now >= next_sync:
