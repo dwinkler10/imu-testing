@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BMI270 raw IMU logger for Raspberry Pi 5 (I2C), direct-register polling.
+"""BMI270 raw IMU logger for Raspberry Pi 4/5 (I2C), FIFO-drain capture.
 
 This runs as a control daemon: on start it initialises the sensor and
 then WAITS on a Unix socket (SOCK_PATH), idle, NOT recording. The
@@ -22,25 +22,30 @@ untouched raw values, so no lowpass/notch filtering is applied here or
 in convert.py. The config is written to the sensor's registers and
 embedded in the recording (it stays constant for that recording).
 
-Samples are polled directly from the data registers as fast as the
-I2C bus allows -- no on-chip FIFO, no sleeps. Each loop iteration
-burst-reads STATUS through SENSORTIME (0x03..0x1A) in one transaction
-and keeps the sample only when STATUS.drdy_acc (drdy_gyr in a
-gyro-only config) reports it as new; reading the data registers
-clears the drdy bit, so each sample is recorded exactly once. Every
-sample hits the OS page cache the moment it is read, which is the
-point: this logger feeds a crash-detection test, so per-sample
-latency from sensor to disk must be one poll cycle (~0.3 ms at 1 MHz
-I2C), not a FIFO drain period.
+Samples are captured through the chip's 2 KB FIFO (header mode) and
+drained as aggressively as the bus allows: each loop iteration reads
+the FIFO fill level and, the moment at least one frame is queued,
+burst-reads the whole backlog in a single write+read transaction and
+appends it to disk. The FIFO is NOT used to batch samples -- with
+continuous draining the sensor-to-disk latency stays at one poll
+cycle, which is the point: this logger feeds a crash-detection test.
+The FIFO is a hardware safety net: when the scheduler stalls the
+loop, samples queue up on-chip (2 KB holds ~157 acc+gyr frames =
+~195 ms at 800 Hz) instead of being overwritten unread, which is
+what the previous direct data-register polling did. Data is lost
+only when a stall outlives the entire FIFO; the chip then overwrites
+the OLDEST frames (keeping the newest -- the ones that matter for a
+crash, streaming mode) and reports the loss in a skip frame, which
+is counted and reported live.
 
-The cost of direct polling is a race against the sample period: if
-the scheduler stalls the loop for more than one ODR period, a sample
-is overwritten unread. Missed samples are detected from the hardware
-sensortime read in the same burst -- a delta of ~k ODR periods means
-k-1 samples were lost -- counted, and reported live. One poll cycle
-is ~0.3-0.4 ms on a Pi 5 at 1 MHz I2C, so 800 Hz (1.25 ms period)
-leaves comfortable margin while 1600 Hz (625 us) does not and will
-drop samples whenever the scheduler hiccups.
+Direct register polling was abandoned because it loses a sample for
+every poll cycle that runs longer than one ODR period: on a Pi 4
+(slower BCM2835 I2C, no multi-message combined transactions) the
+cycle time sat right at the 800 Hz period and ~20% of samples were
+lost. The FIFO burst read is a plain pointer-write + read supported
+by every Pi's I2C controller, and its per-sample bus cost is lower
+than per-register polling (13 bytes/frame, no wasted not-ready
+polls), so the same code path is used on the Pi 4 and Pi 5.
 
 Recordings are named boot_<idx>_<stamp>.bin, where <idx> is a
 monotonic counter persisted in data/.boot_counter (so every start gets
@@ -60,38 +65,43 @@ On-disk format (little-endian):
                     for the recording, so it is stored exactly once here
                     rather than sampled; the converter surfaces it as a
                     latched /config topic in the MCAP.
-  records, 25 bytes each: uint64 host CLOCK_REALTIME [ns] read right
-                          after the sample's I2C burst, uint32
-                          sensortime (24-bit, 39.0625 us/LSB, latched
-                          in the same burst), int16 ax, ay, az, gx,
-                          gy, gz (raw LSB), uint8 saturation
-                          (SATURATION register 0x4A, datasheet 5.2.51:
-                          bit0 acc_x, bit1 acc_y, bit2 acc_z, bit3
-                          gyr_x, bit4 gyr_y, bit5 gyr_z -- each set
-                          when a raw pre-filter sample on that axis
-                          hit the +/-full-scale rail)
+  records, 25 bytes each: uint64 host CLOCK_REALTIME [ns] taken once
+                          per FIFO drain and back-computed one ODR
+                          period per preceding frame in that drain,
+                          uint32 sensortime (24-bit, 39.0625 us/LSB,
+                          reconstructed on the exact ODR grid -- see
+                          below), int16 ax, ay, az, gx, gy, gz (raw
+                          LSB), uint8 saturation from the FIFO
+                          frame-header tag bits: bits 0-2 all set
+                          when any accel axis hit the rail on this
+                          frame, bits 3-5 all set for any gyro axis.
+                          (Per-sensor, not per-axis: the fh_ext tag
+                          carries one bit per sensor. The bits are
+                          broadcast to the per-axis positions so the
+                          format and converters stay unchanged.)
 
-Read consistency. acc/gyr/sensortime are read in one burst spanning
-0x03..0x1A, which is entirely inside the register shadow group
-(STATUS, DATA_x, SENSORTIME_x; datasheet 5.1): starting the burst
-freezes the whole group, so those three are guaranteed to belong to
-the same sample -- they cannot tear mid-read. SATURATION (0x4A) is
-NOT in that shadow group, so it cannot be frozen together with the
-data; it is instead read FIRST in the *same* i2c_rdwr transaction
-(repeated start, single stop), one address-cycle (~tens of us) before
-the data burst latches. It updates synchronously with the data
-registers (5.2.51), so the only residual risk is a <=1-sample edge
-misalignment of the flag if an ODR boundary happens to fall in that
-tiny gap -- harmless, since saturation occurs in multi-sample runs.
-Perfectly frame-locked saturation is only available via the FIFO
-frame-header tag, which this direct-polling logger trades away for
-sensor-to-disk latency.
+Timing. The FIFO does not stamp individual frames, but frames are
+produced exactly one ODR period apart on the sensortime grid, so per
+-sample stamps are reconstructed instead of measured: a sensortime
+control frame (the 24-bit counter latched as a drain empties the
+FIFO) anchors the timeline; each record's sensortime is the anchor
+advanced one period per frame (and per skip-frame drop), which by
+construction lands on the exact power-of-two tick grid. Every later
+sensortime frame re-checks the anchor and any mismatch is converted
+into counted drops, so the reconstruction cannot drift silently.
+Host timestamps carry up to one drain of jitter; the hardware
+timeline is authoritative, as before.
 
-Both timestamps are per-sample and taken at readout, so they carry up
-to one poll cycle of jitter relative to the hardware-exact sample
-instant. The true sample spacing is still exactly one ODR period;
-the converter reconstructs the uniform timeline by rounding
-sensortime deltas to whole periods.
+Saturation comes from the FIFO frame-header fh_ext tag bits
+(FIFO_CONFIG_1: INT1 tag = acc saturation, INT2 tag = gyr
+saturation, datasheet 4.7.4/5.2.50), which are frame-locked to the
+sample -- the exact guarantee the old direct-polling SATURATION
+register read could not provide. The trade is per-axis resolution,
+which the jerk-based detector does not use.
+
+Frame consistency: the FIFO delivers whole frames; a frame only
+partially fetched by a burst is retransmitted in full on the next
+read (datasheet 4.7.2), so records cannot tear across drains.
 
 A record cut off mid-write by a crash is simply a truncated tail; the
 converter drops it. Convert with convert.py.
@@ -129,18 +139,26 @@ MAX_BYTES = 2 * 1024**3
 
 # BMI270 registers (datasheet section 5.2)
 CHIP_ID, INTERNAL_STATUS = 0x00, 0x21
-STATUS = 0x03                  # bit7 drdy_acc, bit6 drdy_gyr
-SATURATION = 0x4A              # per-axis raw-saturation flags (5.2.51)
+SENSORTIME_0 = 0x18            # 24-bit free-running counter, 39.0625 us/LSB
+FIFO_LENGTH_0, FIFO_DATA = 0x24, 0x26
 FEAT_PAGE, GYR_CAS = 0x2F, 0x3C
 ACC_CONF, ACC_RANGE, GYR_CONF, GYR_RANGE = 0x40, 0x41, 0x42, 0x43
+FIFO_CONFIG_0, FIFO_CONFIG_1 = 0x48, 0x49
 INIT_CTRL, INIT_ADDR_0, INIT_ADDR_1, INIT_DATA = 0x59, 0x5B, 0x5C, 0x5E
 PWR_CONF, PWR_CTRL, CMD = 0x7C, 0x7D, 0x7E
+CMD_FIFO_FLUSH = 0xB0
 
-# One poll = one burst read STATUS..SENSORTIME_2 (0x03..0x1A, 24 bytes).
-# Offsets within the burst: 0 STATUS, 1-8 aux (unused), 9-14 acc x/y/z,
-# 15-20 gyr x/y/z, 21-23 sensortime.
-BURST_LEN = 24
-ACC_OFS, ST_OFS = 9, 21
+# FIFO (header mode, datasheet 4.7.1). Each regular frame is a 1-byte
+# header -- fh_mode 0b10 in bits 7-6, enabled-sensor set in bits 5-2,
+# saturation tags in bits 1-0 -- followed by 6 bytes per enabled sensor
+# (gyro data BEFORE accel, the reverse of the data registers). Control
+# frames carry fh_mode 0b01 and an opcode in bits 5-2: skip (1-byte
+# payload: frames lost to overflow), sensortime (3 bytes, sent when a
+# read empties the FIFO), input-config (4 bytes).
+FIFO_SIZE = 2048
+FH_MODE_MASK, FH_REGULAR, FH_CONTROL = 0xC0, 0x80, 0x40
+FH_SKIP, FH_SENSORTIME, FH_CONFIG = 0x0, 0x1, 0x2
+FH_EXT_ACC_SAT, FH_EXT_GYR_SAT = 0x01, 0x02   # INT1/INT2 tag bits
 
 # Register field values -> physical units (datasheet 5.2.42 / 5.2.44)
 ACC_RANGE_G = {0x00: 2, 0x01: 4, 0x02: 8, 0x03: 16}
@@ -167,7 +185,8 @@ DEFAULT_CONFIG = {
 
 HEADER = struct.Struct("<8sbBHI")
 RECORD = struct.Struct("<QIhhhhhhB")
-AXES = struct.Struct("<hhhhhh")
+AXES = struct.Struct("<hhhhhh")    # acc+gyr FIFO payload (gyro first)
+AXES3 = struct.Struct("<hhh")      # single-sensor FIFO payload
 
 
 def odr_hz(code):
@@ -287,6 +306,66 @@ def apply_config(bus, cfg):
     return cas - 128 if cas & 0x40 else cas       # sign-extend 7-bit
 
 
+def setup_fifo(bus, acc_en, gyr_en):
+    """Configure and flush the FIFO for one recording: header mode,
+    streaming (overwrite-oldest on overflow -- for a crash the newest
+    samples matter most), sensortime frame on empty reads, and the
+    fh_ext saturation tags (INT1 tag <- acc_sat, INT2 tag <- gyr_sat,
+    datasheet 5.2.50) so every frame carries frame-locked saturation.
+    FIFO_DOWNS keeps its reset value (filtered data, no downsampling),
+    so the FIFO frame rate is exactly the configured ODR."""
+    bus.write_byte_data(ADDR, FIFO_CONFIG_0, 0x02)   # fifo_time_en, not stop_on_full
+    bus.write_byte_data(ADDR, FIFO_CONFIG_1,
+                        gyr_en << 7 | acc_en << 6 | 0x10   # header mode
+                        | 0x03 << 2 | 0x02)   # int2 tag gyr_sat, int1 tag acc_sat
+    bus.write_byte_data(ADDR, CMD, CMD_FIFO_FLUSH)
+
+
+def parse_fifo_burst(buf, header_base, frame_len):
+    """Split one FIFO burst into (records, skipped, sensortime).
+
+    records:    [(sat_tag_bits, payload bytes)] in FIFO order, whole
+                regular frames only -- a frame cut off at the end of
+                the burst is dropped here and retransmitted in full by
+                the chip on the next read (datasheet 4.7.2).
+    skipped:    frames lost to FIFO overflow (skip-frame payload;
+                always prepended by the chip, so it precedes the
+                records it displaced).
+    sensortime: 24-bit counter from the trailing sensortime frame if
+                this burst emptied the FIFO, else None.
+
+    Parsing stops at the first uninitialized (0x80 overread) or
+    unexpected header; anything beyond it would be garbage."""
+    recs, skipped, st = [], 0, None
+    i, n = 0, len(buf)
+    while i < n:
+        h = buf[i]
+        mode = h & FH_MODE_MASK
+        if mode == FH_REGULAR:
+            if h & 0xFC != header_base or i + frame_len > n:
+                break                     # 0x80 overread / foreign / partial
+            recs.append((h & 0x03, buf[i + 1:i + frame_len]))
+            i += frame_len
+        elif mode == FH_CONTROL:
+            parm = (h >> 2) & 0x0F
+            if parm == FH_SKIP:
+                if i + 2 > n:
+                    break
+                skipped += buf[i + 1]
+                i += 2
+            elif parm == FH_SENSORTIME:
+                if i + 4 <= n:
+                    st = buf[i + 1] | buf[i + 2] << 8 | buf[i + 3] << 16
+                break                     # always the last frame in a read
+            elif parm == FH_CONFIG:
+                i += 5                    # config-change marker, ignored
+            else:
+                break
+        else:
+            break
+    return recs, skipped, st
+
+
 def boot_index_of(name):
     """Parse the boot counter out of a boot_<idx>_<stamp>.bin filename;
     0 if it doesn't match (sorts such files oldest)."""
@@ -399,10 +478,17 @@ class Recorder:
             fd, path = self._open_output(output)
             try:
                 cas = apply_config(self.bus, cfg)
+                setup_fifo(self.bus, cfg["acc_en"], cfg["gyr_en"])
                 os.write(fd, HEADER.pack(
                     b"IMULOG06", cas, ACC_RANGE_G[cfg["acc_range"]],
                     GYR_RANGE_DPS[cfg["gyr_range"]], ticks))
-                cfg_json = json.dumps(cfg, sort_keys=True).encode()
+                # cfg plus capture-mode provenance: fifo_capture=1 marks
+                # FIFO-drain recordings (grid-reconstructed sensortime,
+                # per-sensor saturation broadcast to the axis bits) apart
+                # from older direct-polling files with the same magic. It
+                # surfaces on the MCAP /config topic via the converter.
+                cfg_json = json.dumps({**cfg, "fifo_capture": 1},
+                                      sort_keys=True).encode()
                 os.write(fd, struct.pack("<H", len(cfg_json)) + cfg_json)
                 os.fsync(fd)
             except Exception:
@@ -411,56 +497,94 @@ class Recorder:
             self._stop.clear()
             self.n, self.dropped, self.active = 0, 0, True
             self.path, self.start_ns = path, time.time_ns()
-            drdy_mask = 0x80 if cfg["acc_en"] else 0x40
             self._thread = threading.Thread(
-                target=self._run, args=(fd, ticks, drdy_mask), daemon=True)
+                target=self._run,
+                args=(fd, ticks, cfg["acc_en"], cfg["gyr_en"]), daemon=True)
             self._thread.start()
             return path, self.start_ns
 
-    def _run(self, fd, ticks, drdy_mask):
+    def _run(self, fd, ticks, acc_en, gyr_en):
         try:  # worker inherits normal priority; raise it for tight polling
             os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(50))
         except (AttributeError, PermissionError, OSError):
             pass                              # AttributeError: non-Linux host
         bus = self.bus
-        write, pack, unpack_axes = os.write, RECORD.pack, AXES.unpack_from
-        prev_st = None
+        write, pack = os.write, RECORD.pack
+        both = acc_en and gyr_en
+        header_base = FH_REGULAR | gyr_en << 3 | acc_en << 2
+        frame_len = 1 + 6 * (acc_en + gyr_en)
+        period_ns = ticks * 625000 // 16      # 39062.5 ns/tick, exact
+        grid_mask = 0xFFFFFF & ~(ticks - 1)   # floor onto the ODR tick grid
+        st_next = None                        # grid sensortime of next record
+        last_t = 0                            # host stamps kept monotonic
         next_sync = time.monotonic()
         try:
             while not self._stop.is_set():
-                # Busy-poll in ONE i2c transaction (repeated start, single
-                # stop). SATURATION (0x4A, not in a shadow group) is read
-                # FIRST so it is captured one address-cycle (~tens of us)
-                # before the 0x03..0x1A data burst freezes its shadow group
-                # (STATUS+DATA+SENSORTIME, datasheet 5.1) -- that group is
-                # atomic, so acc/gyr/sensortime are same-frame. The data
-                # read clears drdy, so a sample is kept once.
-                # Pi 4 (BCM2835) I2C rejects multi-message combined
-                # transactions (Errno 95 EOPNOTSUPP), so read SATURATION and
-                # the data burst in two separate SMBus transactions instead of
-                # one atomic i2c_rdwr. The 0x03..0x1A burst is still a single
-                # write-then-read, so STATUS+DATA+SENSORTIME stay same-frame;
-                # only SATURATION is now read in a prior transaction (it is
-                # still read just before the data, as before).
-                sat_byte = bus.read_byte_data(ADDR, SATURATION)
-                buf = bytes(bus.read_i2c_block_data(ADDR, STATUS, BURST_LEN))
-                if not buf[0] & drdy_mask:
+                # Busy-poll the fill level (one cheap 2-byte read, its own
+                # shadow group so the two bytes are consistent) and drain
+                # the moment anything is queued: minimal buffering -- the
+                # FIFO only accumulates while the loop is stalled.
+                lo, hi = bus.read_i2c_block_data(ADDR, FIFO_LENGTH_0, 2)
+                fill = lo | (hi & 0x3F) << 8
+                if fill < frame_len:
                     continue
+                # Overread by 4 bytes: when the burst empties the FIFO the
+                # chip appends the sensortime control frame (header + 3
+                # bytes) -- the timeline anchor. A frame that slipped in
+                # after the fill read shows up as a partial frame instead;
+                # the chip retransmits it in full on the next drain.
+                rd = i2c_msg.read(ADDR, min(fill, FIFO_SIZE) + 4)
+                bus.i2c_rdwr(i2c_msg.write(ADDR, [FIFO_DATA]), rd)
                 t = time.time_ns()
-                ax, ay, az, gx, gy, gz = unpack_axes(buf, ACC_OFS)
-                st = buf[ST_OFS] | buf[ST_OFS + 1] << 8 | buf[ST_OFS + 2] << 16
-                saturation = sat_byte & 0x3F   # 6 per-axis bits (reg 0x4A)
-
-                if prev_st is not None:
-                    # sensortime deltas are k ODR periods + sub-period
-                    # readout jitter; round to whole periods.
-                    periods = (((st - prev_st) & 0xFFFFFF) + ticks // 2) // ticks
-                    if periods > 1:
-                        self.dropped += periods - 1
-                prev_st = st
-
-                write(fd, pack(t, st, ax, ay, az, gx, gy, gz, saturation))
-                self.n += 1
+                recs, skipped, st_frame = parse_fifo_burst(
+                    bytes(rd), header_base, frame_len)
+                if skipped:                   # overflow while stalled >195 ms
+                    self.dropped += skipped
+                    if st_next is not None:
+                        st_next = (st_next + skipped * ticks) & 0xFFFFFF
+                if not recs:
+                    continue
+                n_recs = len(recs)
+                if st_next is None:
+                    # First drain: anchor the grid. Samples land exactly on
+                    # ODR ticks, so flooring the counter gives the last
+                    # record's slot; the register read is a startup-only
+                    # fallback if this drain did not empty the FIFO (its
+                    # small error is corrected by the next re-anchor).
+                    if st_frame is None:
+                        b = bus.read_i2c_block_data(ADDR, SENSORTIME_0, 3)
+                        st_frame = b[0] | b[1] << 8 | b[2] << 16
+                    st_next = ((st_frame & grid_mask)
+                               - (n_recs - 1) * ticks) & 0xFFFFFF
+                for k, (tag, payload) in enumerate(recs):
+                    if both:                  # FIFO order: gyro, then accel
+                        gx, gy, gz, ax, ay, az = AXES.unpack(payload)
+                    elif acc_en:
+                        (ax, ay, az), gx, gy, gz = AXES3.unpack(payload), 0, 0, 0
+                    else:
+                        (gx, gy, gz), ax, ay, az = AXES3.unpack(payload), 0, 0, 0
+                    sat = ((0x07 if tag & FH_EXT_ACC_SAT else 0)
+                           | (0x38 if tag & FH_EXT_GYR_SAT else 0))
+                    # Back-computed host stamp, clamped monotonic: a drain
+                    # can land less than one backlog-worth after the
+                    # previous one, which would step time backwards. The
+                    # sensortime grid is the authoritative timeline.
+                    tk = t - (n_recs - 1 - k) * period_ns
+                    last_t = tk if tk > last_t else last_t + 1
+                    write(fd, pack(last_t, st_next,
+                                   ax, ay, az, gx, gy, gz, sat))
+                    st_next = (st_next + ticks) & 0xFFFFFF
+                self.n += n_recs
+                if st_frame is not None:
+                    # Re-anchor: the sensortime frame is latched as the
+                    # drain empties, so its floor must equal the last
+                    # record's slot (= st_next - ticks). A positive
+                    # mismatch is unaccounted frames -> count as dropped
+                    # and resync; the grid cannot drift silently.
+                    drift = ((st_frame & grid_mask) - st_next + ticks) & 0xFFFFFF
+                    if drift and drift < 0x800000:
+                        self.dropped += drift // ticks
+                        st_next = (st_next + drift) & 0xFFFFFF
                 now = time.monotonic()
                 if now >= next_sync:
                     os.fsync(fd)
