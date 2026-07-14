@@ -111,8 +111,8 @@ sudo imu-loggerd start                       # picks up the edited config
 | `gyr_range` | `GYR_RANGE` | `0x00` | `0x00`=±2000dps … `0x04`=±125dps |
 
 Missing keys fall back to the defaults above. The config is validated when a
-`capture` starts: an unknown key or unsupported value makes that
-`imu-loggerd capture` fail with the error (and no recording starts) rather
+a recording starts: an unknown key or unsupported value makes that
+`imu-loggerd start` fail with the error (and no recording starts) rather
 than recording bad data. One constraint: **`acc_odr` must equal `gyr_odr`
 while both sensors are enabled** — one data-ready bit triggers the record of
 both sensors' registers, so they must share a sample clock. Rates above 800 Hz
@@ -127,7 +127,7 @@ Run the daemon in the foreground, then drive it from another shell:
 sudo systemctl stop imu-logger               # free the sensor + socket first
 sudo python3 /opt/imu-logger/imu_logger.py   # daemon in foreground; Ctrl-C to quit
 # in another shell:
-sudo imu-loggerd capture -o /tmp/bench.bin
+sudo imu-loggerd start -o /tmp/bench.bin
 sudo imu-loggerd stop
 ```
 
