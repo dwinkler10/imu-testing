@@ -90,14 +90,14 @@ CLI talk over `/run/imu-logger.sock` (override with `$IMU_LOGGER_SOCK`).
 ## Configuration
 
 `/opt/imu-logger/config.json` is the **default** config used by
-`imu-loggerd capture` when you don't pass `-c`. It holds the raw BMI270
+`imu-loggerd start` when you don't pass `-c`. It holds the raw BMI270
 register field values (hex strings or ints). Edit it, then start a new
-recording — the config is read fresh at each `capture`, so no service restart
+recording — the config is read fresh at each `start`, so no service restart
 is needed:
 
 ```sh
 sudo nano /opt/imu-logger/config.json
-sudo imu-loggerd capture                     # picks up the edited config
+sudo imu-loggerd start                       # picks up the edited config
 ```
 
 | key | register field | default | meaning |
