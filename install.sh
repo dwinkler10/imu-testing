@@ -28,6 +28,7 @@ fi
 echo "== installing files to $DEST =="
 mkdir -p "$DEST/data"
 install -m 755 "$SRC/imu_logger.py" "$DEST/"
+install -m 755 "$SRC/imu-loggerd" /usr/local/bin/imu-loggerd   # control CLI, on PATH
 install -m 644 "$SRC/bmi270_config.bin" "$DEST/"
 if [ ! -f "$DEST/config.json" ]; then
     install -m 644 "$SRC/config.json" "$DEST/"
@@ -44,9 +45,12 @@ if [ "$NEED_REBOOT" -eq 1 ]; then
     echo
     echo "I2C baudrate was just configured -- reboot to apply:"
     echo "    sudo reboot"
-    echo "Logging starts automatically after the reboot."
+    echo "The daemon comes up idle after the reboot; start a recording with"
+    echo "    sudo imu-loggerd start"
 else
     systemctl restart imu-logger
     sleep 2
     systemctl --no-pager --lines=5 status imu-logger || true
+    echo
+    echo "daemon is up and IDLE. start recording with: sudo imu-loggerd start"
 fi

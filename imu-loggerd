@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""imu-loggerd -- control the imu-logger recording daemon.
+
+The daemon (imu_logger.py, run by the imu-logger systemd service) keeps
+the BMI270 initialised and idle until told to record. This CLI drives it
+over the daemon's control socket:
+
+    imu-loggerd start [-o FILE] [-c CONFIG]     start a recording
+    imu-loggerd stop                            stop + flush the recording
+    imu-loggerd status                          show daemon/recording state
+
+start options:
+  -o/--output FILE    write the .bin here instead of the default
+                      data/boot_<n>_<stamp>.bin; errors if FILE exists.
+  -c/--config CONFIG  use this config.json instead of the daemon's default.
+
+On a successful start the daemon replies with the start timestamp and
+the recording path. Exit status is 0 on success, 1 on a daemon-reported
+error, 2 if the daemon is not reachable.
+
+The socket path defaults to /run/imu-logger.sock and can be overridden
+with $IMU_LOGGER_SOCK (must match the daemon's).
+"""
+import argparse
+import json
+import os
+import socket
+import sys
+
+SOCK_PATH = os.environ.get("IMU_LOGGER_SOCK", "/run/imu-logger.sock")
+
+
+def send(req):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(SOCK_PATH)
+    except (FileNotFoundError, ConnectionRefusedError, PermissionError) as e:
+        sys.exit(f"imu-loggerd: daemon not reachable at {SOCK_PATH} "
+                 f"(is the imu-logger service running?): {e}")
+    try:
+        s.sendall((json.dumps(req) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        s.close()
+    if not buf:
+        sys.exit("imu-loggerd: no response from daemon")
+    return json.loads(buf.decode())
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="imu-loggerd", description="control the imu-logger recording daemon")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    pc = sub.add_parser("start", help="start a recording")
+    pc.add_argument("-o", "--output",
+                    help="output .bin path (default: data/boot_<n>_<stamp>.bin)")
+    pc.add_argument("-c", "--config",
+                    help="config.json path (default: the daemon's config.json)")
+    sub.add_parser("stop", help="stop the current recording")
+    sub.add_parser("status", help="show daemon/recording status")
+    args = ap.parse_args()
+
+    req = {"cmd": args.cmd}
+    if args.cmd == "start":
+        # resolve paths on the client side, relative to the caller's cwd,
+        # since the daemon runs elsewhere (e.g. cwd=/)
+        if args.output:
+            req["output"] = os.path.abspath(args.output)
+        if args.config:
+            req["config"] = os.path.abspath(args.config)
+
+    resp = send(req)
+    print(resp.get("message") or json.dumps(resp))
+    sys.exit(0 if resp.get("ok") else 1)
+
+
+if __name__ == "__main__":
+    main()

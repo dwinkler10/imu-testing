@@ -4,9 +4,14 @@ After=multi-user.target
 
 [Service]
 Type=simple
-# Reads /opt/imu-logger/config.json at startup; edit it and
-# `sudo systemctl restart imu-logger` to begin a new recording
-# with the new settings. Recordings land in /opt/imu-logger/data/.
+# Runs the logger as a control daemon: it initialises the BMI270 and
+# waits on /run/imu-logger.sock, IDLE (not recording). Start/stop
+# recordings with the imu-loggerd CLI:
+#   sudo imu-loggerd start [-o file.bin] [-c config.json]
+#   sudo imu-loggerd stop
+#   sudo imu-loggerd status
+# Recordings land in /opt/imu-logger/data/ by default. On stop
+# (systemctl stop / SIGTERM) an in-progress recording is flushed.
 ExecStart=/usr/bin/python3 /opt/imu-logger/imu_logger.py
 Restart=always
 RestartSec=2

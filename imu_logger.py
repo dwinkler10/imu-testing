@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
 """BMI270 raw IMU logger for Raspberry Pi 5 (I2C), direct-register polling.
 
-Sensor configuration is read from config.json next to this script
-(see DEFAULT_CONFIG below for keys and defaults; values may be hex
-strings like "0x0b" or plain ints). The defaults are accel 800 Hz
-+/-16g, gyro 800 Hz +/-2000dps, performance (aliasing-free) filter
-mode -- a jerk-based crash detector needs full bandwidth and untouched
-raw values, not a smoothed or decimated signal, so no lowpass/notch
-filtering is applied here or in convert.py. The config is read once at
-startup; edit it and `sudo systemctl restart imu-logger` to begin a
-new recording with the new settings.
+This runs as a control daemon: on start it initialises the sensor and
+then WAITS on a Unix socket (SOCK_PATH), idle, NOT recording. The
+`imu-loggerd` CLI drives it:
+
+    imu-loggerd start [-o file.bin] [-c config.json]     # start recording
+    imu-loggerd stop                                     # stop + flush
+    imu-loggerd status                                   # daemon state
+
+So the systemd unit can be up and armed across a whole session while
+recordings are started/stopped on demand, each to its own file.
+
+Sensor configuration is read from a config.json (the one next to this
+script by default, or the file passed to `start -c`) at the moment a
+recording starts (see DEFAULT_CONFIG below for keys and defaults; values
+may be hex strings like "0x0b" or plain ints). The defaults are accel
+800 Hz +/-16g, gyro 800 Hz +/-2000dps, performance (aliasing-free)
+filter mode -- a jerk-based crash detector needs full bandwidth and
+untouched raw values, so no lowpass/notch filtering is applied here or
+in convert.py. The config is written to the sensor's registers and
+embedded in the recording (it stays constant for that recording).
 
 Samples are polled directly from the data registers as fast as the
 I2C bus allows -- no on-chip FIFO, no sleeps. Each loop iteration
@@ -87,12 +98,19 @@ converter drops it. Convert with convert.py.
 """
 import json
 import os
+import signal
+import socket
 import struct
+import threading
 import time
 
 from smbus2 import SMBus, i2c_msg
 
 I2C_BUS = 1
+# Control socket. The daemon initialises the sensor and waits here; it
+# records only when imu-loggerd sends a `start` command, and stops on
+# `stop`. Override for local testing via $IMU_LOGGER_SOCK.
+SOCK_PATH = os.environ.get("IMU_LOGGER_SOCK", "/run/imu-logger.sock")
 ADDR = 0x68                    # SDO -> GND (0x69 if SDO -> VDDIO)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_BLOB = os.path.join(SCRIPT_DIR, "bmi270_config.bin")
@@ -215,7 +233,13 @@ def load_config(path=CONFIG_PATH):
     return cfg
 
 
-def init_bmi270(bus, cfg):
+def init_bmi270(bus):
+    """One-time bring-up: soft reset + upload the 8 kB Bosch config blob.
+
+    Done once when the daemon starts (the blob only needs reloading after
+    a power-on/reset). The per-recording data-path registers are written
+    separately by apply_config so a capture can pick a different config
+    without re-uploading the blob."""
     if bus.read_byte_data(ADDR, CHIP_ID) != 0x24:
         raise SystemExit("BMI270 not found (bad chip id) -- check wiring/address")
 
@@ -240,8 +264,12 @@ def init_bmi270(bus, cfg):
             raise SystemExit("BMI270 init failed (INTERNAL_STATUS != init_ok)")
         time.sleep(0.005)
 
-    # Compose the data-path registers from the user config
-    # (datasheet 5.2.41-5.2.44, 5.2.85).
+
+def apply_config(bus, cfg):
+    """Write the data-path registers for one recording and return the
+    gyro cross-axis (CAS) factor. Called at the start of every capture,
+    so each recording can use its own config (datasheet 5.2.41-5.2.44,
+    5.2.85)."""
     pwr_ctrl = 0x08 | cfg["acc_en"] << 2 | cfg["gyr_en"] << 1   # + temp sensor
     acc_conf = cfg["acc_filter_perf"] << 7 | cfg["acc_bwp"] << 4 | cfg["acc_odr"]
     gyr_conf = (cfg["gyr_filter_perf"] << 7 | cfg["gyr_noise_perf"] << 6
@@ -332,50 +360,81 @@ def open_recording():
     raise SystemExit(f"could not create a unique recording file in {OUT_DIR}")
 
 
-def main():
-    try:  # real-time priority; needs root, best effort otherwise
-        os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(50))
-    except PermissionError:
-        print("warning: no permission for SCHED_FIFO, running at normal priority")
+class Recorder:
+    """Owns the recording. At most one recording at a time; the poll loop
+    runs in a worker thread so the control socket stays responsive to a
+    `stop` while a capture is in progress."""
 
-    cfg = load_config()
-    odr_code = cfg["acc_odr"] if cfg["acc_en"] else cfg["gyr_odr"]
-    ticks = odr_ticks(odr_code)
-    rate_hz = odr_hz(odr_code)
-    drdy_mask = 0x80 if cfg["acc_en"] else 0x40   # STATUS.drdy_acc / drdy_gyr
-    print(f"sensors: acc {'on' if cfg['acc_en'] else 'off'} "
-          f"(+/-{ACC_RANGE_G[cfg['acc_range']]}g), "
-          f"gyr {'on' if cfg['gyr_en'] else 'off'} "
-          f"(+/-{GYR_RANGE_DPS[cfg['gyr_range']]}dps), ODR {rate_hz:g} Hz "
-          f"({ticks} sensortime ticks/sample); "
-          f"polling data registers continuously, no FIFO")
+    def __init__(self, bus):
+        self.bus = bus
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self.active = False
+        self.path = None
+        self.start_ns = None
+        self.n = 0
+        self.dropped = 0
 
-    with SMBus(I2C_BUS) as bus:
-        cas = init_bmi270(bus, cfg)
+    def _open_output(self, output):
+        """(fd, path) for the recording. Default -> boot-counter name in
+        OUT_DIR with rolling-storage prune; explicit -o -> that exact path,
+        erroring if it already exists (O_EXCL)."""
+        if not output:
+            return open_recording()
+        path = os.path.abspath(output)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            raise RuntimeError(f"output path already exists: {path}")
+        return fd, path
 
-        fd, path = open_recording()
-        os.write(fd, HEADER.pack(b"IMULOG06", cas, ACC_RANGE_G[cfg["acc_range"]],
-                                 GYR_RANGE_DPS[cfg["gyr_range"]], ticks))
-        # Config block: the resolved config is constant for this recording,
-        # so store it once. length-prefixed JSON, right after the header.
-        cfg_json = json.dumps(cfg, sort_keys=True).encode()
-        os.write(fd, struct.pack("<H", len(cfg_json)) + cfg_json)
-        os.fsync(fd)
-        print(f"logging to {path} (Ctrl-C to stop)")
+    def start(self, cfg, output=None):
+        with self._lock:
+            if self.active:
+                raise RuntimeError(f"already recording to {self.path}")
+            odr_code = cfg["acc_odr"] if cfg["acc_en"] else cfg["gyr_odr"]
+            ticks = odr_ticks(odr_code)
+            fd, path = self._open_output(output)
+            try:
+                cas = apply_config(self.bus, cfg)
+                os.write(fd, HEADER.pack(
+                    b"IMULOG06", cas, ACC_RANGE_G[cfg["acc_range"]],
+                    GYR_RANGE_DPS[cfg["gyr_range"]], ticks))
+                cfg_json = json.dumps(cfg, sort_keys=True).encode()
+                os.write(fd, struct.pack("<H", len(cfg_json)) + cfg_json)
+                os.fsync(fd)
+            except Exception:
+                os.close(fd)
+                raise
+            self._stop.clear()
+            self.n, self.dropped, self.active = 0, 0, True
+            self.path, self.start_ns = path, time.time_ns()
+            drdy_mask = 0x80 if cfg["acc_en"] else 0x40
+            self._thread = threading.Thread(
+                target=self._run, args=(fd, ticks, drdy_mask), daemon=True)
+            self._thread.start()
+            return path, self.start_ns
 
+    def _run(self, fd, ticks, drdy_mask):
+        try:  # worker inherits normal priority; raise it for tight polling
+            os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(50))
+        except (AttributeError, PermissionError, OSError):
+            pass                              # AttributeError: non-Linux host
+        bus = self.bus
         write, pack, unpack_axes = os.write, RECORD.pack, AXES.unpack_from
-        n, dropped, prev_st = 0, 0, None
+        prev_st = None
         next_sync = time.monotonic()
         try:
-            while True:
+            while not self._stop.is_set():
                 # Busy-poll in ONE i2c transaction (repeated start, single
                 # stop). SATURATION (0x4A, not in a shadow group) is read
                 # FIRST so it is captured one address-cycle (~tens of us)
-                # before the 0x03..0x1A data burst freezes its shadow
-                # group -- that group (STATUS+DATA+SENSORTIME, datasheet
-                # 5.1) is atomic, so acc/gyr/sensortime are same-frame,
-                # and the sat-to-data gap is bounded to that address cycle.
-                # The data read clears drdy, so a sample is kept once.
+                # before the 0x03..0x1A data burst freezes its shadow group
+                # (STATUS+DATA+SENSORTIME, datasheet 5.1) -- that group is
+                # atomic, so acc/gyr/sensortime are same-frame. The data
+                # read clears drdy, so a sample is kept once.
                 sat = i2c_msg.read(ADDR, 1)
                 data = i2c_msg.read(ADDR, BURST_LEN)
                 bus.i2c_rdwr(i2c_msg.write(ADDR, [SATURATION]), sat,
@@ -389,28 +448,122 @@ def main():
                 saturation = bytes(sat)[0] & 0x3F   # 6 per-axis bits (reg 0x4A)
 
                 if prev_st is not None:
-                    # Hardware sensortime deltas are k ODR periods plus
-                    # sub-period readout jitter; round to whole periods.
+                    # sensortime deltas are k ODR periods + sub-period
+                    # readout jitter; round to whole periods.
                     periods = (((st - prev_st) & 0xFFFFFF) + ticks // 2) // ticks
                     if periods > 1:
-                        dropped += periods - 1
-                        print(f"warning: poll loop fell behind, "
-                              f"~{periods - 1} sample(s) lost")
+                        self.dropped += periods - 1
                 prev_st = st
 
                 write(fd, pack(t, st, ax, ay, az, gx, gy, gz, saturation))
-                n += 1
+                self.n += 1
                 now = time.monotonic()
                 if now >= next_sync:
                     os.fsync(fd)
                     next_sync = now + FSYNC_INTERVAL_S
-        except KeyboardInterrupt:
-            pass
         finally:
             os.fsync(fd)
             os.close(fd)
-            suffix = f" (~{dropped} lost to poll-loop stalls)" if dropped else ""
-            print(f"\n{n} samples written to {path}{suffix}")
+
+    def stop(self):
+        with self._lock:
+            if not self.active:
+                raise RuntimeError("not recording")
+            self._stop.set()
+            thread = self._thread
+        thread.join()
+        with self._lock:
+            self.active = False
+            return {"path": self.path, "samples": self.n, "dropped": self.dropped}
+
+    def status(self):
+        with self._lock:
+            return {"active": self.active, "path": self.path,
+                    "samples": self.n, "dropped": self.dropped,
+                    "start_ns": self.start_ns}
+
+
+def handle_command(recorder, req):
+    """Map one control request to a JSON-able response."""
+    cmd = req.get("cmd")
+    if cmd == "start":
+        cfg = load_config(req.get("config") or CONFIG_PATH)
+        path, start_ns = recorder.start(cfg, req.get("output"))
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S",
+                           time.localtime(start_ns / 1e9))
+        return {"ok": True, "path": path, "start_ns": start_ns, "timestamp": ts,
+                "message": f"recording started {ts} -> {path}"}
+    if cmd == "stop":
+        s = recorder.stop()
+        drop = f", ~{s['dropped']} lost to stalls" if s["dropped"] else ""
+        return {"ok": True, "message":
+                f"stopped: {s['samples']} samples -> {s['path']}{drop}", **s}
+    if cmd == "status":
+        s = recorder.status()
+        state = "recording" if s["active"] else "idle"
+        where = f" ({s['samples']} samples -> {s['path']})" if s["active"] else ""
+        return {"ok": True, "message": f"{state}{where}", **s}
+    return {"ok": False, "message": f"unknown command {cmd!r}"}
+
+
+def serve(recorder):
+    """Listen on SOCK_PATH; one newline-delimited JSON request/response per
+    connection. Blocks (idle, ~0 CPU) until a client connects."""
+    if os.path.exists(SOCK_PATH):
+        os.unlink(SOCK_PATH)                      # clear a stale socket
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCK_PATH)
+    os.chmod(SOCK_PATH, 0o660)
+    srv.listen(4)
+    print(f"imu-logger daemon ready on {SOCK_PATH} -- idle, not recording")
+    try:
+        while True:
+            conn, _ = srv.accept()
+            with conn:
+                try:
+                    buf = b""
+                    while b"\n" not in buf:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    req = json.loads(buf.decode() or "{}")
+                    resp = handle_command(recorder, req)
+                except (Exception, SystemExit) as e:   # SystemExit: bad config
+                    resp = {"ok": False, "message": f"{type(e).__name__}: {e}"}
+                try:
+                    conn.sendall((json.dumps(resp) + "\n").encode())
+                except OSError:
+                    pass
+    finally:
+        srv.close()
+        if os.path.exists(SOCK_PATH):
+            os.unlink(SOCK_PATH)
+
+
+def _on_sigterm(signum, frame):
+    # systemd stop -> unwind serve()'s accept() the same way Ctrl-C does,
+    # so an in-progress capture is flushed on the way out.
+    raise KeyboardInterrupt
+
+
+def main():
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    try:  # real-time priority; needs root, best effort otherwise
+        os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(50))
+    except (AttributeError, PermissionError, OSError):
+        print("warning: SCHED_FIFO unavailable, running at normal priority")
+
+    with SMBus(I2C_BUS) as bus:
+        init_bmi270(bus)                          # one-time blob upload
+        recorder = Recorder(bus)
+        try:
+            serve(recorder)
+        except KeyboardInterrupt:
+            if recorder.active:                   # flush an in-progress capture
+                s = recorder.stop()
+                print(f"\nshutdown: stopped recording, "
+                      f"{s['samples']} samples -> {s['path']}")
 
 
 if __name__ == "__main__":
