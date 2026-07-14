@@ -1,14 +1,14 @@
-altgraph @ file:///AppleInternal/Library/BuildRoots/4~CQH2ugAdEkxx3ZkrZolIWlkoB3pJrxMjVv7CK8s/Library/Caches/com.apple.xbs/TemporaryDirectory.1I3Zwu/Sources/python3/altgraph-0.17.2-py2.py3-none-any.whl
+altgraph==0.17.2
 contourpy==1.3.0
 cycler==0.12.1
 fonttools==4.60.2
-future @ file:///AppleInternal/Library/BuildRoots/4~CQH2ugAdEkxx3ZkrZolIWlkoB3pJrxMjVv7CK8s/Library/Caches/com.apple.xbs/TemporaryDirectory.1I3Zwu/Sources/python3/future-0.18.2-py3-none-any.whl
+future==0.18.2
 grpcio==1.80.0
 grpcio-tools==1.80.0
 importlib_resources==6.5.2
 kiwisolver==1.4.7
 lz4==4.4.5
-macholib @ file:///AppleInternal/Library/BuildRoots/4~CQH2ugAdEkxx3ZkrZolIWlkoB3pJrxMjVv7CK8s/Library/Caches/com.apple.xbs/TemporaryDirectory.1I3Zwu/Sources/python3/macholib-1.15.2-py2.py3-none-any.whl
+macholib==1.15.2
 matplotlib==3.9.4
 mcap==1.4.0
 mcap-protobuf-support==0.5.4
@@ -20,7 +20,7 @@ pyparsing==3.3.2
 pypdf==6.14.2
 python-dateutil==2.9.0.post0
 scipy==1.13.1
-six @ file:///AppleInternal/Library/BuildRoots/4~CQH2ugAdEkxx3ZkrZolIWlkoB3pJrxMjVv7CK8s/Library/Caches/com.apple.xbs/TemporaryDirectory.1I3Zwu/Sources/python3/six-1.15.0-py2.py3-none-any.whl
+six==1.15.0
 typing_extensions==4.16.0
 zipp==3.23.1
 zstandard==0.25.0
