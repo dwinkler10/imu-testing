@@ -38,10 +38,17 @@ unclean power cut). data/ is capped at MAX_BYTES: the oldest boot_*.bin
 files are deleted at startup until the directory fits.
 
 On-disk format (little-endian):
-  header, 16 bytes: magic "IMULOG05", int8 gyro CAS factor_zx,
+  header, 16 bytes: magic "IMULOG06", int8 gyro CAS factor_zx,
                     uint8 accel range [g], uint16 gyro range [dps],
                     uint32 sensortime ticks per sample
                     (ticks are 39.0625 us; 800 Hz -> 32 ticks)
+  config block:     uint16 length, then that many bytes of UTF-8 JSON --
+                    the fully-resolved sensor config (the register field
+                    values from config.json merged over the defaults).
+                    The config is read once at startup and is immutable
+                    for the recording, so it is stored exactly once here
+                    rather than sampled; the converter surfaces it as a
+                    latched /config topic in the MCAP.
   records, 25 bytes each: uint64 host CLOCK_REALTIME [ns] read right
                           after the sample's I2C burst, uint32
                           sensortime (24-bit, 39.0625 us/LSB, latched
@@ -347,8 +354,12 @@ def main():
         cas = init_bmi270(bus, cfg)
 
         fd, path = open_recording()
-        os.write(fd, HEADER.pack(b"IMULOG05", cas, ACC_RANGE_G[cfg["acc_range"]],
+        os.write(fd, HEADER.pack(b"IMULOG06", cas, ACC_RANGE_G[cfg["acc_range"]],
                                  GYR_RANGE_DPS[cfg["gyr_range"]], ticks))
+        # Config block: the resolved config is constant for this recording,
+        # so store it once. length-prefixed JSON, right after the header.
+        cfg_json = json.dumps(cfg, sort_keys=True).encode()
+        os.write(fd, struct.pack("<H", len(cfg_json)) + cfg_json)
         os.fsync(fd)
         print(f"logging to {path} (Ctrl-C to stop)")
 

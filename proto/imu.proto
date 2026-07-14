@@ -10,6 +10,21 @@ message AxisFlags {
   bool z = 3;
 }
 
+// Sensor configuration for a recording. Constant for the whole log
+// (read once at startup), published as a latched /config topic: the
+// converter re-emits it periodically so Foxglove shows it at any seek.
+message LoggerConfig {
+  string format = 1;                    // on-disk magic, e.g. "IMULOG06"
+  double sample_rate_hz = 2;            // derived from the header tick count
+  uint32 acc_range_g = 3;              // +/- full scale, g
+  uint32 gyr_range_dps = 4;            // +/- full scale, deg/s
+  int32 gyr_cas_factor_zx = 5;         // gyro cross-axis correction factor
+  // Raw BMI270 register field values from config.json (acc_odr, acc_bwp,
+  // acc_filter_perf, gyr_odr, ...). Empty for pre-IMULOG06 recordings,
+  // which did not embed the full config.
+  map<string, int32> registers = 6;
+}
+
 // One BMI270 sample from the Raspberry Pi crash logger (imu_logger.py).
 message ImuSample {
   uint64 host_time_ns = 1;    // Pi CLOCK_REALTIME at readout

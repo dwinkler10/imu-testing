@@ -25,15 +25,21 @@ _sym_db = _symbol_database.Default()
 import common_pb2 as common__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\timu.proto\x12\x08\x63rashlog\x1a\x0c\x63ommon.proto\",\n\tAxisFlags\x12\t\n\x01x\x18\x01 \x01(\x08\x12\t\n\x01y\x18\x02 \x01(\x08\x12\t\n\x01z\x18\x03 \x01(\x08\"\xd6\x01\n\tImuSample\x12\x14\n\x0chost_time_ns\x18\x01 \x01(\x04\x12\x12\n\nsensortime\x18\x02 \x01(\r\x12\"\n\x07\x61\x63\x63\x65l_g\x18\x03 \x01(\x0b\x32\x11.crashlog.Vector3\x12#\n\x08gyro_dps\x18\x04 \x01(\x0b\x32\x11.crashlog.Vector3\x12*\n\racc_saturated\x18\x05 \x01(\x0b\x32\x13.crashlog.AxisFlags\x12*\n\rgyr_saturated\x18\x06 \x01(\x0b\x32\x13.crashlog.AxisFlagsb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\timu.proto\x12\x08\x63rashlog\x1a\x0c\x63ommon.proto\",\n\tAxisFlags\x12\t\n\x01x\x18\x01 \x01(\x08\x12\t\n\x01y\x18\x02 \x01(\x08\x12\t\n\x01z\x18\x03 \x01(\x08\"\xe9\x01\n\x0cLoggerConfig\x12\x0e\n\x06\x66ormat\x18\x01 \x01(\t\x12\x16\n\x0esample_rate_hz\x18\x02 \x01(\x01\x12\x13\n\x0b\x61\x63\x63_range_g\x18\x03 \x01(\r\x12\x15\n\rgyr_range_dps\x18\x04 \x01(\r\x12\x19\n\x11gyr_cas_factor_zx\x18\x05 \x01(\x05\x12\x38\n\tregisters\x18\x06 \x03(\x0b\x32%.crashlog.LoggerConfig.RegistersEntry\x1a\x30\n\x0eRegistersEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\"\xd6\x01\n\tImuSample\x12\x14\n\x0chost_time_ns\x18\x01 \x01(\x04\x12\x12\n\nsensortime\x18\x02 \x01(\r\x12\"\n\x07\x61\x63\x63\x65l_g\x18\x03 \x01(\x0b\x32\x11.crashlog.Vector3\x12#\n\x08gyro_dps\x18\x04 \x01(\x0b\x32\x11.crashlog.Vector3\x12*\n\racc_saturated\x18\x05 \x01(\x0b\x32\x13.crashlog.AxisFlags\x12*\n\rgyr_saturated\x18\x06 \x01(\x0b\x32\x13.crashlog.AxisFlagsb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'imu_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
+  _globals['_LOGGERCONFIG_REGISTERSENTRY']._loaded_options = None
+  _globals['_LOGGERCONFIG_REGISTERSENTRY']._serialized_options = b'8\001'
   _globals['_AXISFLAGS']._serialized_start=37
   _globals['_AXISFLAGS']._serialized_end=81
-  _globals['_IMUSAMPLE']._serialized_start=84
-  _globals['_IMUSAMPLE']._serialized_end=298
+  _globals['_LOGGERCONFIG']._serialized_start=84
+  _globals['_LOGGERCONFIG']._serialized_end=317
+  _globals['_LOGGERCONFIG_REGISTERSENTRY']._serialized_start=269
+  _globals['_LOGGERCONFIG_REGISTERSENTRY']._serialized_end=317
+  _globals['_IMUSAMPLE']._serialized_start=320
+  _globals['_IMUSAMPLE']._serialized_end=534
 # @@protoc_insertion_point(module_scope)

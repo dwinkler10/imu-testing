@@ -5,10 +5,15 @@
 Usage: python3 convert.py data/boot_000001_20260707_120000.bin
 Writes .csv and .mcap next to the input file.
 
-Reads the direct-polling logger's IMULOG05 format (and older
-IMULOG02..04): the header carries the configured ranges and the
-sample spacing in sensortime ticks. The per-record flags byte is
-decoded per format:
+Reads the direct-polling logger's IMULOG06 format (and older
+IMULOG02..05): the header carries the configured ranges and the
+sample spacing in sensortime ticks. IMULOG06 additionally embeds the
+fully-resolved sensor config (JSON, right after the header); it is
+surfaced as a latched /config topic (crashlog.LoggerConfig),
+re-emitted every CONFIG_TOPIC_INTERVAL_S so Foxglove shows it at any
+seek point. The per-record flags byte is decoded per format:
+  IMULOG06 -> same 6-bit SATURATION register as IMULOG05, plus the
+              embedded config block.
   IMULOG05 -> BMI270 SATURATION register 0x4A, six per-axis bits
               (acc x/y/z, gyr x/y/z): a raw pre-filter sample on that
               axis hit the +/-full-scale rail.
@@ -31,6 +36,7 @@ Applies the gyro cross-axis (CAS) correction from datasheet section
   gx_corrected = gx - factor_zx * gz / 2^9
 """
 import csv
+import json
 import os
 import struct
 import sys
@@ -41,6 +47,9 @@ from mcap_protobuf.writer import Writer  # noqa: E402
 
 HEADER = struct.Struct("<8sbBHI")
 RECORD = struct.Struct("<QIhhhhhhB")   # host_t, st, ax,ay,az,gx,gy,gz, flags
+# IMULOG06 embeds the resolved config as a latched /config topic; re-emit
+# it this often (in host-time seconds) so Foxglove shows it at any seek.
+CONFIG_TOPIC_INTERVAL_S = 10.0
 
 
 def main(path):
@@ -50,11 +59,18 @@ def main(path):
     magic, cas, acc_range, gyr_range, ticks = HEADER.unpack(raw[:HEADER.size])
     if magic == b"IMULOG02":
         ticks = 16                         # fixed 1600 Hz era, field was reserved
-    elif magic not in (b"IMULOG03", b"IMULOG04", b"IMULOG05"):
-        raise SystemExit(f"unknown magic {magic!r} (expected IMULOG02..IMULOG05)")
-    per_axis_sat = magic == b"IMULOG05"    # 6-bit hardware SATURATION register
+    elif magic not in (b"IMULOG03", b"IMULOG04", b"IMULOG05", b"IMULOG06"):
+        raise SystemExit(f"unknown magic {magic!r} (expected IMULOG02..IMULOG06)")
+    per_axis_sat = magic in (b"IMULOG05", b"IMULOG06")  # 6-bit SATURATION reg
     rate_hz = 25600 / ticks                # sensortime runs at 25.6 kHz
-    body = raw[HEADER.size:]
+    off = HEADER.size
+    registers = {}
+    if magic == b"IMULOG06":               # length-prefixed JSON config block
+        (clen,) = struct.unpack_from("<H", raw, off)
+        off += 2
+        registers = json.loads(raw[off:off + clen].decode())
+        off += clen
+    body = raw[off:]
     n = len(body) // RECORD.size
     if len(body) % RECORD.size:
         print(f"note: dropped {len(body) % RECORD.size} corrupted tail bytes")
@@ -73,10 +89,27 @@ def main(path):
     mcap_f = open(base + ".mcap", "wb")
     mw = Writer(mcap_f)
 
+    # Latched /config topic: build once (config is constant for the log),
+    # re-emitted every CONFIG_TOPIC_INTERVAL_S below so Foxglove shows it
+    # wherever the playhead is.
+    cfg_msg = imu_pb2.LoggerConfig(
+        format=magic.decode(errors="replace"), sample_rate_hz=rate_hz,
+        acc_range_g=acc_range, gyr_range_dps=gyr_range, gyr_cas_factor_zx=cas)
+    for k, v in registers.items():
+        try:
+            cfg_msg.registers[k] = int(v)
+        except (TypeError, ValueError):
+            pass
+    config_interval_ns = int(CONFIG_TOPIC_INTERVAL_S * 1e9)
+    next_config_t = None
+
     prev_st, gaps, dropped = None, 0, 0
     acc_sat_n, gyr_sat_n = 0, 0
     for i in range(n):
         t, st, ax, ay, az, gx, gy, gz, flags = RECORD.unpack_from(body, i * RECORD.size)
+        if next_config_t is None or t >= next_config_t:   # latched /config
+            mw.write_message("/config", cfg_msg, log_time=t, publish_time=t)
+            next_config_t = t + config_interval_ns
         if per_axis_sat:                          # SATURATION reg 0x4A bits
             a = (bool(flags & 0x01), bool(flags & 0x02), bool(flags & 0x04))
             g = (bool(flags & 0x08), bool(flags & 0x10), bool(flags & 0x20))

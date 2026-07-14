@@ -107,7 +107,12 @@ Produces `.csv` and `.mcap` next to the input. Messages are protobuf-encoded
 `crashlog.ImuSample` ([proto/imu.proto](proto/imu.proto)); open the `.mcap`
 in [Foxglove](https://foxglove.dev) and plot `/imu.accel_g.x` …
 `/imu.gyro_dps.z`, plus the boolean `/imu.acc_saturated` /
-`/imu.gyr_saturated` flags. The converter drops a crash-truncated partial last
+`/imu.gyr_saturated` flags. A second **`/config`** topic
+(`crashlog.LoggerConfig`) carries the sensor configuration for the recording
+— sample rate, ranges, CAS factor, and the raw register field values. It is
+constant for a recording (read once at startup and embedded in the `.bin`),
+so it's re-emitted every 10 s to act as a **latched** topic: view it in a
+Foxglove Raw Messages panel and it shows the config at any playhead position. The converter drops a crash-truncated partial last
 record automatically, reports total saturation counts, and cross-checks for
 sample loss via sensortime gaps (the logger also reports every loss live).
 
