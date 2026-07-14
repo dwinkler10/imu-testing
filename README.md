@@ -15,8 +15,13 @@ test sees data in true realtime instead of waiting out a FIFO drain interval.
 The tradeoff: if the OS stalls the poll loop for more than one sample period,
 that sample is overwritten unread. At 800 Hz (1.25 ms period) the loop has
 comfortable margin; missed samples are detected via hardware **sensortime**
-gaps, counted, and reported live and at exit (1600 Hz previously dropped ~4 %
-this way — that's why 800 Hz is the recommended ceiling).
+gaps and counted (1600 Hz previously dropped ~4 % this way — that's why
+800 Hz is the recommended ceiling).
+
+The logger runs as a **control daemon**: the systemd service keeps the sensor
+initialised and idle, and you start/stop recordings on demand with the
+**`imu-loggerd`** CLI (`start` / `stop` / `status`). Nothing is recorded
+until you ask for it — see [Controlling recordings](#controlling-recordings).
 
 ## Wiring — check pin 4!
 
@@ -41,14 +46,15 @@ OS Lite Pi reachable over SSH:
 ./deploy.sh pi@raspberrypi.local
 ```
 
-This packages `imu_logger.py`, `config.json`, the Bosch init blob, and the
-systemd unit; then runs [install.sh](install.sh) on the Pi, which enables I2C
-at 1 MHz (fast-mode+), apt-installs `python3-smbus2`, installs everything to
-`/opt/imu-logger`, and enables + starts the `imu-logger` service (logging
-from every boot — recommended for crash capture). If the I2C baudrate was
-newly configured it asks for one `sudo reboot`; logging starts automatically
-afterwards. Re-running `deploy.sh` updates the code but **preserves an edited
-`config.json` on the Pi**.
+This packages `imu_logger.py`, the `imu-loggerd` CLI, `config.json`, the Bosch
+init blob, and the systemd unit; then runs [install.sh](install.sh) on the Pi,
+which enables I2C at 1 MHz (fast-mode+), apt-installs `python3-smbus2`,
+installs the daemon to `/opt/imu-logger`, the `imu-loggerd` control CLI to
+`/usr/local/bin`, and enables + starts the `imu-logger` service. The daemon
+comes up **idle every boot** — armed but not recording — so you start captures
+on demand (see below). If the I2C baudrate was newly configured it asks for
+one `sudo reboot`. Re-running `deploy.sh` updates the code but **preserves an
+edited `config.json` on the Pi**.
 
 Recordings land in `/opt/imu-logger/data/boot_<idx>_<YYYYMMDD_HHMMSS>.bin`
 (~72 MB/h at 800 Hz; a ~20 min flight is ~24 MB). `<idx>` is a monotonic
@@ -59,15 +65,39 @@ only; the counter guarantees uniqueness). `data/` is a **rolling 2 GB store**
 (`MAX_BYTES`): the oldest recordings are deleted at startup until it fits, so
 the card never fills — no manual clearing needed.
 
+## Controlling recordings
+
+The `imu-logger` service runs a daemon that keeps the BMI270 initialised and
+**idle**; recordings are started and stopped with the `imu-loggerd` CLI (needs
+root, like the sensor itself):
+
+```sh
+sudo imu-loggerd status                      # idle, or recording (+ sample count)
+sudo imu-loggerd start                       # start; default data/boot_<n>_<stamp>.bin
+sudo imu-loggerd start -o /path/run1.bin     # start into a specific file
+sudo imu-loggerd start -c /path/alt.json     # start with a specific config
+sudo imu-loggerd stop                        # stop + flush the current recording
+```
+
+On a successful `start` the daemon replies with the start timestamp and the
+recording path. `-o`/`--output` writes the `.bin` to that exact path instead
+of the default, and **errors if the file already exists**; `-c`/`--config`
+picks a config file other than the daemon's default. Only one recording runs
+at a time (a second `start` errors). Stopping the service — or a `SIGTERM`
+from systemd — flushes any in-progress recording before exit. The daemon and
+CLI talk over `/run/imu-logger.sock` (override with `$IMU_LOGGER_SOCK`).
+
 ## Configuration
 
-`/opt/imu-logger/config.json` holds the raw BMI270 register field values
-(hex strings or ints). Edit it, then start a new recording with the new
-settings:
+`/opt/imu-logger/config.json` is the **default** config used by
+`imu-loggerd start` when you don't pass `-c`. It holds the raw BMI270
+register field values (hex strings or ints). Edit it, then start a new
+recording — the config is read fresh at each `start`, so no service restart
+is needed:
 
 ```sh
 sudo nano /opt/imu-logger/config.json
-sudo systemctl restart imu-logger
+sudo imu-loggerd start                       # picks up the edited config
 ```
 
 | key | register field | default | meaning |
@@ -80,20 +110,25 @@ sudo systemctl restart imu-logger
 | `acc_range` | `ACC_RANGE` | `0x03` | `0x00`=±2g … `0x03`=±16g |
 | `gyr_range` | `GYR_RANGE` | `0x00` | `0x00`=±2000dps … `0x04`=±125dps |
 
-Missing keys fall back to the defaults above. The config is validated at
-startup and the service fails visibly (see `systemctl status imu-logger`) on
-unknown keys or unsupported values rather than recording bad data. One
-constraint: **`acc_odr` must equal `gyr_odr` while both sensors are enabled**
-— one data-ready bit triggers the record of both sensors' registers, so they
-must share a sample clock. Rates above 800 Hz are accepted but the poll loop
-(~0.3–0.4 ms/cycle) will lose samples whenever the scheduler hiccups; the
-logger reports every loss live.
+Missing keys fall back to the defaults above. The config is validated when a
+a recording starts: an unknown key or unsupported value makes that
+`imu-loggerd start` fail with the error (and no recording starts) rather
+than recording bad data. One constraint: **`acc_odr` must equal `gyr_odr`
+while both sensors are enabled** — one data-ready bit triggers the record of
+both sensors' registers, so they must share a sample clock. Rates above 800 Hz
+are accepted but the poll loop (~0.3–0.4 ms/cycle) will lose samples whenever
+the scheduler hiccups; losses are counted and reported by `stop`.
 
 ## Run manually (bench tests)
 
+Run the daemon in the foreground, then drive it from another shell:
+
 ```sh
-sudo systemctl stop imu-logger           # free the sensor first
-sudo python3 /opt/imu-logger/imu_logger.py   # sudo -> real-time priority; Ctrl-C to stop
+sudo systemctl stop imu-logger               # free the sensor + socket first
+sudo python3 /opt/imu-logger/imu_logger.py   # daemon in foreground; Ctrl-C to quit
+# in another shell:
+sudo imu-loggerd start -o /tmp/bench.bin
+sudo imu-loggerd stop
 ```
 
 ## Convert to CSV + Foxglove MCAP

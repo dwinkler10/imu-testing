@@ -14,7 +14,7 @@ set -eu
 HOST=$1
 SRC=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-FILES="imu_logger.py config.json bmi270_config.bin imu-logger.service install.sh"
+FILES="imu_logger.py imu-loggerd config.json bmi270_config.bin imu-logger.service install.sh"
 for f in $FILES; do
     [ -f "$SRC/$f" ] || { echo "missing $SRC/$f"; exit 1; }
 done
@@ -27,8 +27,10 @@ echo "== running installer on $HOST (will sudo) =="
 ssh -t "$HOST" 'sudo /tmp/imu-logger-pkg/install.sh'
 
 echo
-echo "done. useful commands on the Pi:"
-echo "  sudo systemctl status imu-logger        # check it's recording"
-echo "  sudo nano /opt/imu-logger/config.json   # change sample rate etc."
-echo "  sudo systemctl restart imu-logger       # start new recording with new config"
+echo "done. the daemon is up and IDLE (armed, not recording). control it:"
+echo "  sudo imu-loggerd status                 # daemon / recording state"
+echo "  sudo imu-loggerd start                  # start recording (default file)"
+echo "  sudo imu-loggerd start -o run1.bin -c my.json     # custom file/config"
+echo "  sudo imu-loggerd stop                   # stop + flush the recording"
+echo "  sudo systemctl status imu-logger        # is the daemon running?"
 echo "  ls /opt/imu-logger/data/                # recordings"
