@@ -435,17 +435,21 @@ class Recorder:
                 # (STATUS+DATA+SENSORTIME, datasheet 5.1) -- that group is
                 # atomic, so acc/gyr/sensortime are same-frame. The data
                 # read clears drdy, so a sample is kept once.
-                sat = i2c_msg.read(ADDR, 1)
-                data = i2c_msg.read(ADDR, BURST_LEN)
-                bus.i2c_rdwr(i2c_msg.write(ADDR, [SATURATION]), sat,
-                             i2c_msg.write(ADDR, [STATUS]), data)
-                buf = bytes(data)
+                # Pi 4 (BCM2835) I2C rejects multi-message combined
+                # transactions (Errno 95 EOPNOTSUPP), so read SATURATION and
+                # the data burst in two separate SMBus transactions instead of
+                # one atomic i2c_rdwr. The 0x03..0x1A burst is still a single
+                # write-then-read, so STATUS+DATA+SENSORTIME stay same-frame;
+                # only SATURATION is now read in a prior transaction (it is
+                # still read just before the data, as before).
+                sat_byte = bus.read_byte_data(ADDR, SATURATION)
+                buf = bytes(bus.read_i2c_block_data(ADDR, STATUS, BURST_LEN))
                 if not buf[0] & drdy_mask:
                     continue
                 t = time.time_ns()
                 ax, ay, az, gx, gy, gz = unpack_axes(buf, ACC_OFS)
                 st = buf[ST_OFS] | buf[ST_OFS + 1] << 8 | buf[ST_OFS + 2] << 16
-                saturation = bytes(sat)[0] & 0x3F   # 6 per-axis bits (reg 0x4A)
+                saturation = sat_byte & 0x3F   # 6 per-axis bits (reg 0x4A)
 
                 if prev_st is not None:
                     # sensortime deltas are k ODR periods + sub-period
